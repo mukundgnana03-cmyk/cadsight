@@ -1,0 +1,6 @@
+{
+  "name": "CADSight Metrology & 3D Engineering Workbench",
+  "description": "Precision CAD inspection, orthographic studio rendering, deterministic geometric metrology, BOM extraction, and conversational 3D solid/mesh modification workbench.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
