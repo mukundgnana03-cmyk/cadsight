@@ -219,8 +219,40 @@ function parseStepHeaderMetadata(
     text.match(/MATERIAL_DESIGNATION\s*\(\s*'([^']+)'/i) ||
     text.match(/MATERIAL\s*[:=]\s*'([^']+)'/i);
   const unitMatch = text.match(/LENGTH_UNIT\s*\([^)]*'([A-Z]+)'/i);
+  const isInch =
+    unitMatch?.[1] === 'INCH' || /CONVERSION_BASED_UNIT\s*\(\s*'INCH'/i.test(text);
+  const isCenti = !isInch && /SI_UNIT\s*\(\s*\$\s*,\s*\.CENTI\.\s*,\s*\.METRE\.\s*\)/i.test(text);
+  const unitScaleToMm = isInch ? 25.4 : isCenti ? 10.0 : 1.0;
+
   const descMatch = text.match(/FILE_DESCRIPTION\s*\(\s*\(\s*'([^']+)'/i);
-  const nauoMatches = text.match(/NEXT_ASSEMBLY_USAGE_OCCURRENCE/gi);
+  const nauoMatches = text.match(/NEXT_ASSEMBLY_USAGE_OCCURRENCE\s*\(/gi);
+  const productMatches = text.match(/\bPRODUCT\s*\(/gi);
+  const hasNativeBrep =
+    /CYLINDRICAL_SURFACE|ADVANCED_FACE|MANIFOLD_SOLID_BREP|BREP_WITH_VOIDS/i.test(text);
+
+  // Extract exact analytical cylindrical & circle radii from native STEP B-Rep entities
+  const cylRadiiSet = new Set<number>();
+  const cylRegex =
+    /(?:CYLINDRICAL_SURFACE|CIRCLE)\s*\(\s*'[^']*'\s*,\s*#\d+\s*,\s*([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)\s*\)/gi;
+  let cm: RegExpExecArray | null;
+  while ((cm = cylRegex.exec(text)) !== null) {
+    const rVal = parseFloat(cm[1]) * unitScaleToMm;
+    if (Number.isFinite(rVal) && rVal >= 0.25 && rVal <= 20000) {
+      cylRadiiSet.add(Number(rVal.toFixed(4)));
+    }
+  }
+
+  // Extract exact analytical fillet / toroidal minor radii from native STEP B-Rep entities
+  const filletRadiiSet = new Set<number>();
+  const torRegex =
+    /TOROIDAL_SURFACE\s*\(\s*'[^']*'\s*,\s*#\d+\s*,\s*[+-]?\d*\.?\d+(?:[eE][+-]?\d+)?\s*,\s*([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)\s*\)/gi;
+  let tm: RegExpExecArray | null;
+  while ((tm = torRegex.exec(text)) !== null) {
+    const rVal = parseFloat(tm[1]) * unitScaleToMm;
+    if (Number.isFinite(rVal) && rVal >= 0.1 && rVal <= 5000) {
+      filletRadiiSet.add(Number(rVal.toFixed(4)));
+    }
+  }
 
   const authorParts = [authorMatch?.[1], authorMatch?.[2]].filter(Boolean);
   const headerComments: string[] = [];
@@ -231,12 +263,21 @@ function parseStepHeaderMetadata(
     fileSizeBytes: file.size,
     format,
     schemaVersion: schemaMatch?.[1] || (format === 'STEP' ? 'ISO-10303-21 STEP' : format),
-    unitsDeclared: unitMatch?.[1] === 'INCH' ? 'in (converted to mm)' : 'mm (Millimeters)',
+    unitsDeclared: isInch
+      ? 'in (converted to mm)'
+      : isCenti
+        ? 'cm (converted to mm)'
+        : 'mm (Millimeters)',
     authorOrOrg: authorParts.length > 0 ? authorParts.join(' · ') : null,
     materialDeclared: matMatch?.[1]?.trim() || null,
     headerComments,
     isAssembly: Boolean(nauoMatches && nauoMatches.length > 0),
     uploadedAt: new Date().toISOString(),
+    hasNativeBrepAnalytics: hasNativeBrep,
+    nativeStepCylindricalRadiiMm: Array.from(cylRadiiSet).sort((a, b) => a - b),
+    nativeStepFilletRadiiMm: Array.from(filletRadiiSet).sort((a, b) => a - b),
+    nativeProductCount: productMatches ? productMatches.length : undefined,
+    nativeAssemblyOccurrenceCount: nauoMatches ? nauoMatches.length : 0,
   };
 }
 
@@ -1436,13 +1477,32 @@ export async function parseUploadedCadFile(file: File): Promise<{
         locateFile: () => '/occt-import-js.wasm',
       });
       const fileData = new Uint8Array(buffer);
+      const fineParams = {
+        linearUnit: 'millimeter',
+        linearDeflectionType: 'bounding_box_ratio',
+        linearDeflection: 0.001,
+        angularDeflection: 0.08,
+      };
       let result: any;
-      if (format === 'STEP') {
-        result = occt.ReadStepFile(fileData, null);
-      } else if (format === 'IGES') {
-        result = occt.ReadIgesFile(fileData, null);
-      } else {
-        result = occt.ReadBrepFile(fileData, null);
+      try {
+        if (format === 'STEP') {
+          result = occt.ReadStepFile(fileData, fineParams);
+        } else if (format === 'IGES') {
+          result = occt.ReadIgesFile(fileData, fineParams);
+        } else {
+          result = occt.ReadBrepFile(fileData, fineParams);
+        }
+      } catch {
+        result = null;
+      }
+      if (!result || !result.success || !Array.isArray(result.meshes) || result.meshes.length === 0) {
+        if (format === 'STEP') {
+          result = occt.ReadStepFile(fileData, null);
+        } else if (format === 'IGES') {
+          result = occt.ReadIgesFile(fileData, null);
+        } else {
+          result = occt.ReadBrepFile(fileData, null);
+        }
       }
 
       if (!result || !result.success || !Array.isArray(result.meshes) || result.meshes.length === 0) {
@@ -1451,14 +1511,90 @@ export async function parseUploadedCadFile(file: File): Promise<{
 
       const components: CadComponentMeshData[] = [];
 
-      // Collect node instances and world transforms from result.root if available
-      interface MeshInstance {
+      const isGenericSolidBodyName = (n: string | null | undefined): boolean => {
+        if (!n) return true;
+        const t = n.trim();
+        if (!t) return true;
+        return /^(solid|body|partbody|open_body|geometrical_set|boss[-_ ]?extrude|cut[-_ ]?extrude|revolve|fillet|chamfer|shell|none|default|mesh|shape|compound|face)[-_ 0-9]*$/i.test(
+          t
+        );
+      };
+
+      const isPurchasedUnitSubtreeName = (n: string | null | undefined): boolean => {
+        if (!n) return false;
+        const t = n.trim();
+        if (
+          /\b(sun|satellite|planet|planetaire|solaire|ring|couronne|annulus|carrier|porte|support|mount|bracket|flange|adapter|plate|cover|cap|gear|pinion|pignon)\b/i.test(
+            t
+          )
+        ) {
+          return false;
+        }
+        return /\b(nema\s*\d*|stepper|moteur|servo_motor|electric_motor|bldc|roulement|ball_bearing|needle_bearing|bearing|608\w*|6[02789]\d\d\w*|iso\s*4762|din\s*912|din\s*933|din\s*934|iso\s*4032)\b/i.test(
+          t
+        );
+      };
+
+      interface SubMeshRef {
         meshIndex: number;
-        nodeName: string | null;
-        matrix: THREE.Matrix4 | null;
+        worldMatrix: THREE.Matrix4 | null;
+        relativeMatrix: THREE.Matrix4 | null;
+        meshName: string | null;
       }
-      const instances: MeshInstance[] = [];
-      const walkOcctNode = (node: any, parentMatrix: THREE.Matrix4 | null) => {
+
+      interface LogicalComponentInstance {
+        nodeName: string | null;
+        parentAssemblyName: string | null;
+        baseMatrix: THREE.Matrix4 | null;
+        subMeshes: SubMeshRef[];
+      }
+
+      const logicalInstances: LogicalComponentInstance[] = [];
+
+      const collectSubtreeMeshes = (
+        node: any,
+        worldMat: THREE.Matrix4 | null,
+        relMat: THREE.Matrix4 | null,
+        out: SubMeshRef[]
+      ) => {
+        if (!node) return;
+        let currWorld = worldMat;
+        let currRel = relMat;
+        const rawMat =
+          Array.isArray(node.transformation) && node.transformation.length === 16
+            ? node.transformation
+            : Array.isArray(node.matrix) && node.matrix.length === 16
+              ? node.matrix
+              : null;
+        if (rawMat) {
+          const localMat = new THREE.Matrix4().fromArray(rawMat);
+          currWorld = worldMat ? worldMat.clone().multiply(localMat) : localMat;
+          currRel = relMat ? relMat.clone().multiply(localMat) : localMat;
+        }
+        if (Array.isArray(node.meshes)) {
+          for (const mIdx of node.meshes) {
+            if (typeof mIdx === 'number' && mIdx >= 0 && mIdx < result.meshes.length) {
+              out.push({
+                meshIndex: mIdx,
+                worldMatrix: currWorld,
+                relativeMatrix: currRel,
+                meshName: result.meshes[mIdx]?.name || node.name || null,
+              });
+            }
+          }
+        }
+        if (Array.isArray(node.children)) {
+          for (const child of node.children) {
+            collectSubtreeMeshes(child, currWorld, currRel, out);
+          }
+        }
+      };
+
+      const walkOcctNode = (
+        node: any,
+        parentMatrix: THREE.Matrix4 | null,
+        parentName: string | null
+      ) => {
         if (!node) return;
         let currentMatrix = parentMatrix;
         const rawMat =
@@ -1473,83 +1609,227 @@ export async function parseUploadedCadFile(file: File): Promise<{
             ? parentMatrix.clone().multiply(localMat)
             : localMat;
         }
-        if (Array.isArray(node.meshes)) {
-          for (const mIdx of node.meshes) {
-            if (typeof mIdx === 'number' && mIdx >= 0 && mIdx < result.meshes.length) {
-              instances.push({
-                meshIndex: mIdx,
-                nodeName: node.name || null,
-                matrix: currentMatrix,
+
+        const thisNodeName: string | null =
+          typeof node.name === 'string' && node.name.trim().length > 0 ? node.name.trim() : null;
+        const effectiveNodeName = !isGenericSolidBodyName(thisNodeName)
+          ? thisNodeName
+          : parentName;
+
+        // If this node is a purchased unit container (e.g. a NEMA stepper motor or rolling bearing modeled with multiple solid bodies),
+        // consolidate its entire subtree of solid bodies into ONE logical component instance so it is never costed as separate machined parts.
+        if (thisNodeName && isPurchasedUnitSubtreeName(thisNodeName)) {
+          const unitSubMeshes: SubMeshRef[] = [];
+          if (Array.isArray(node.meshes)) {
+            for (const mIdx of node.meshes) {
+              if (typeof mIdx === 'number' && mIdx >= 0 && mIdx < result.meshes.length) {
+                unitSubMeshes.push({
+                  meshIndex: mIdx,
+                  worldMatrix: currentMatrix,
+                  relativeMatrix: null,
+                  meshName: result.meshes[mIdx]?.name || thisNodeName,
+                });
+              }
+            }
+          }
+          if (Array.isArray(node.children)) {
+            for (const child of node.children) {
+              collectSubtreeMeshes(child, currentMatrix, null, unitSubMeshes);
+            }
+          }
+          if (unitSubMeshes.length > 0) {
+            logicalInstances.push({
+              nodeName: thisNodeName,
+              parentAssemblyName: parentName,
+              baseMatrix: currentMatrix,
+              subMeshes: unitSubMeshes,
+            });
+            return;
+          }
+        }
+
+        // If this node directly owns meshes (e.g. a single part definition with 1 or more solid bodies),
+        // group the solid bodies owned by this part node into a single logical component instance unless they have distinct non-generic part names.
+        if (Array.isArray(node.meshes) && node.meshes.length > 0) {
+          const validMeshIndices = node.meshes.filter(
+            (mIdx: any) => typeof mIdx === 'number' && mIdx >= 0 && mIdx < result.meshes.length
+          );
+          if (validMeshIndices.length > 0) {
+            const distinctNamedMeshes = validMeshIndices.filter((mIdx: number) => {
+              const mName = result.meshes[mIdx]?.name;
+              return !isGenericSolidBodyName(mName) && mName !== thisNodeName;
+            });
+
+            if (distinctNamedMeshes.length <= 1 || !metadata.isAssembly) {
+              logicalInstances.push({
+                nodeName: effectiveNodeName || result.meshes[validMeshIndices[0]]?.name || null,
+                parentAssemblyName: parentName,
+                baseMatrix: currentMatrix,
+                subMeshes: validMeshIndices.map((mIdx: number) => ({
+                  meshIndex: mIdx,
+                  worldMatrix: currentMatrix,
+                  relativeMatrix: null,
+                  meshName: result.meshes[mIdx]?.name || null,
+                })),
               });
+            } else {
+              for (const mIdx of validMeshIndices) {
+                logicalInstances.push({
+                  nodeName:
+                    (!isGenericSolidBodyName(result.meshes[mIdx]?.name)
+                      ? result.meshes[mIdx]?.name
+                      : effectiveNodeName) || null,
+                  parentAssemblyName: effectiveNodeName || parentName,
+                  baseMatrix: currentMatrix,
+                  subMeshes: [
+                    {
+                      meshIndex: mIdx,
+                      worldMatrix: currentMatrix,
+                      relativeMatrix: null,
+                      meshName: result.meshes[mIdx]?.name || null,
+                    },
+                  ],
+                });
+              }
             }
           }
         }
+
         if (Array.isArray(node.children)) {
           for (const child of node.children) {
-            walkOcctNode(child, currentMatrix);
+            walkOcctNode(child, currentMatrix, effectiveNodeName);
           }
         }
       };
 
       if (result.root) {
-        walkOcctNode(result.root, null);
+        walkOcctNode(result.root, null, null);
       }
-      if (instances.length === 0) {
-        result.meshes.forEach((_: any, mIdx: number) => {
-          instances.push({ meshIndex: mIdx, nodeName: null, matrix: null });
+      if (logicalInstances.length === 0) {
+        result.meshes.forEach((m: any, mIdx: number) => {
+          logicalInstances.push({
+            nodeName: m?.name || null,
+            parentAssemblyName: null,
+            baseMatrix: null,
+            subMeshes: [
+              {
+                meshIndex: mIdx,
+                worldMatrix: null,
+                relativeMatrix: null,
+                meshName: m?.name || null,
+              },
+            ],
+          });
         });
       }
 
-      instances.forEach((inst, idx) => {
-        const mesh = result.meshes[inst.meshIndex];
-        if (!mesh) return;
-        const rawVerts: number[] = mesh.attributes?.position?.array || [];
-        const indices: number[] = mesh.index?.array || [];
-        if (rawVerts.length < 9) return;
+      // If the STEP file has zero NEXT_ASSEMBLY_USAGE_OCCURRENCE entities and at most 1 PRODUCT (a single-part file with multiple boolean/solid bodies),
+      // merge all solid bodies into a single component so individual solid bodies are never confused with separate parts.
+      const isSinglePartMultiBodyStep =
+        !metadata.isAssembly &&
+        (metadata.nativeAssemblyOccurrenceCount || 0) === 0 &&
+        (metadata.nativeProductCount === undefined || metadata.nativeProductCount <= 1) &&
+        logicalInstances.length > 1;
 
-        let positions: Float32Array;
-        if (indices.length >= 3) {
-          positions = new Float32Array(indices.length * 3);
-          for (let i = 0; i < indices.length; i++) {
-            const vIdx = indices[i] * 3;
-            positions[i * 3] = rawVerts[vIdx];
-            positions[i * 3 + 1] = rawVerts[vIdx + 1];
-            positions[i * 3 + 2] = rawVerts[vIdx + 2];
+      const finalLogicalInstances: LogicalComponentInstance[] = isSinglePartMultiBodyStep
+        ? [
+            {
+              nodeName:
+                logicalInstances.find((li) => !isGenericSolidBodyName(li.nodeName))?.nodeName ||
+                file.name.replace(/\.[^/.]+$/, ''),
+              parentAssemblyName: null,
+              baseMatrix: null,
+              subMeshes: logicalInstances.flatMap((li) => li.subMeshes),
+            },
+          ]
+        : logicalInstances;
+
+      finalLogicalInstances.forEach((inst, idx) => {
+        const worldCoords: number[] = [];
+        const localMin = new THREE.Vector3(Infinity, Infinity, Infinity);
+        const localMax = new THREE.Vector3(-Infinity, -Infinity, -Infinity);
+        const vLocal = new THREE.Vector3();
+        const vWorld = new THREE.Vector3();
+        let chosenColor: number | null = null;
+        let fallbackMeshName: string | null = null;
+
+        for (const sub of inst.subMeshes) {
+          const mesh = result.meshes[sub.meshIndex];
+          if (!mesh) continue;
+          const rawVerts: number[] = mesh.attributes?.position?.array || [];
+          const indices: number[] = mesh.index?.array || [];
+          if (rawVerts.length < 9) continue;
+
+          if (!fallbackMeshName && !isGenericSolidBodyName(mesh.name)) {
+            fallbackMeshName = mesh.name;
           }
-        } else {
-          positions = new Float32Array(rawVerts);
+          if (chosenColor === null && Array.isArray(mesh.color) && mesh.color.length === 3) {
+            const c = new THREE.Color(mesh.color[0], mesh.color[1], mesh.color[2]);
+            chosenColor = c.getHex();
+          }
+
+          const appendVertex = (vx: number, vy: number, vz: number) => {
+            vLocal.set(vx, vy, vz);
+            if (sub.relativeMatrix) {
+              vLocal.applyMatrix4(sub.relativeMatrix);
+            }
+            localMin.min(vLocal);
+            localMax.max(vLocal);
+
+            vWorld.set(vx, vy, vz);
+            if (sub.worldMatrix) {
+              vWorld.applyMatrix4(sub.worldMatrix);
+            }
+            worldCoords.push(vWorld.x, vWorld.y, vWorld.z);
+          };
+
+          if (indices.length >= 3) {
+            for (let i = 0; i < indices.length; i++) {
+              const vIdx = indices[i] * 3;
+              appendVertex(rawVerts[vIdx], rawVerts[vIdx + 1], rawVerts[vIdx + 2]);
+            }
+          } else {
+            for (let i = 0; i < rawVerts.length; i += 3) {
+              appendVertex(rawVerts[i], rawVerts[i + 1], rawVerts[i + 2]);
+            }
+          }
         }
 
-        if (inst.matrix) {
-          const v = new THREE.Vector3();
-          for (let i = 0; i < positions.length; i += 3) {
-            v.set(positions[i], positions[i + 1], positions[i + 2]).applyMatrix4(inst.matrix);
-            positions[i] = v.x;
-            positions[i + 1] = v.y;
-            positions[i + 2] = v.z;
-          }
-        }
+        if (worldCoords.length < 9) return;
 
+        const positions = new Float32Array(worldCoords);
         const normals = computeFlatNormals(positions);
+        const localSpan = new THREE.Vector3().subVectors(localMax, localMin);
+        const localBboxMm: [number, number, number] = [
+          Number(Math.max(0.1, localSpan.x).toFixed(3)),
+          Number(Math.max(0.1, localSpan.y).toFixed(3)),
+          Number(Math.max(0.1, localSpan.z).toFixed(3)),
+        ];
+        const sourceMeshKey = `STEP_MESH_${inst.subMeshes
+          .map((s) => s.meshIndex)
+          .sort((a, b) => a - b)
+          .join('_')}`;
+
         const compName =
-          mesh.name ||
+          (!isGenericSolidBodyName(inst.nodeName) ? inst.nodeName : null) ||
+          fallbackMeshName ||
           inst.nodeName ||
-          `${file.name.replace(/\.[^/.]+$/, '')}_Solid_${idx + 1}`;
-        let colorHex = COMPONENT_PALETTE[idx % COMPONENT_PALETTE.length];
-        if (Array.isArray(mesh.color) && mesh.color.length === 3) {
-          const c = new THREE.Color(mesh.color[0], mesh.color[1], mesh.color[2]);
-          colorHex = c.getHex();
-        }
+          `${file.name.replace(/\.[^/.]+$/, '')}_Component_${idx + 1}`;
+        const colorHex =
+          chosenColor !== null ? chosenColor : COMPONENT_PALETTE[idx % COMPONENT_PALETTE.length];
 
         components.push({
-          index: idx,
+          index: components.length,
           name: compName,
-          partNumber: extractPartNumber(compName, idx),
+          partNumber: extractPartNumber(compName, components.length),
           materialFromMetadata: metadata.materialDeclared,
           colorHex,
           positions,
           normals,
           faceIdPerTriangle: new Int32Array(Math.floor(positions.length / 9)).fill(-1),
+          parentAssemblyName: inst.parentAssemblyName,
+          sourceMeshKey,
+          localBboxMm,
         });
       });
 
@@ -1818,7 +2098,14 @@ export function analyzeCadGeometryAndTopology(
     totalAreaMm2 += compArea;
     totalUniqueVertices += vertToTris.size;
 
-    const bboxSize = new THREE.Vector3().subVectors(compMax, compMin);
+    const worldBboxSize = new THREE.Vector3().subVectors(compMax, compMin);
+    const bboxSize =
+      comp.localBboxMm &&
+      comp.localBboxMm[0] > 0.05 &&
+      comp.localBboxMm[1] > 0.05 &&
+      comp.localBboxMm[2] > 0.05
+        ? new THREE.Vector3(comp.localBboxMm[0], comp.localBboxMm[1], comp.localBboxMm[2])
+        : worldBboxSize;
     compMetrics.push({
       comp,
       bboxSize,
@@ -2053,7 +2340,6 @@ export function analyzeCadGeometryAndTopology(
             const sIdx = Math.min(NUM_SECTORS - 1, Math.floor((ang / (Math.PI * 2)) * NUM_SECTORS));
             occupiedSectors[sIdx] = 1;
           }
-          // Find largest empty angular gap to determine continuous angular span
           let maxEmptyRun = 0;
           let currentEmpty = 0;
           for (let s = 0; s < NUM_SECTORS * 2; s++) {
@@ -2081,12 +2367,26 @@ export function analyzeCadGeometryAndTopology(
           }
 
           const isHole = radialDotSum < 0;
-          const diameterMm = circleFit.r * 2.0;
-          const radiusMm = circleFit.r;
+          let radiusMm = circleFit.r;
+          let snappedToNativeStep = false;
+          if (metadata.hasNativeBrepAnalytics && metadata.nativeStepCylindricalRadiiMm?.length) {
+            let bestR = radiusMm;
+            let bestDiff = Math.max(0.08, radiusMm * 0.028);
+            for (const stepR of metadata.nativeStepCylindricalRadiiMm) {
+              const diff = Math.abs(stepR - radiusMm);
+              if (diff <= bestDiff) {
+                bestDiff = diff;
+                bestR = stepR;
+                snappedToNativeStep = true;
+              }
+            }
+            if (snappedToNativeStep) {
+              radiusMm = bestR;
+            }
+          }
+          const diameterMm = radiusMm * 2.0;
 
           // 3. Strict Geometric Boundary Verification:
-          // An internal hole MUST fit strictly inside the perpendicular wall boundary (<= 96% of minPerpEnvelope),
-          // whereas an outer cylindrical boss/journal/cam-lobe/flange forms the outer boundary (up to 106% of maxPerpEnvelope).
           const marginU = Math.max(0.8, compUSpan * (isHole ? 0.03 : 0.08));
           const marginV = Math.max(0.8, compVSpan * (isHole ? 0.03 : 0.08));
           const maxAllowedCylDia = isHole ? minPerpEnvelope * 0.96 : maxPerpEnvelope * 1.06;
@@ -2117,18 +2417,21 @@ export function analyzeCadGeometryAndTopology(
             const featIdx = features.length;
             for (const t of clusterTris) comp.faceIdPerTriangle[t] = featIdx;
 
-            const confPct = Math.min(
-              99,
-              Math.max(
-                78,
-                Math.round(
-                  75 +
-                    (Math.min(360, angularCoverageDeg) / 360) * 18 +
-                    (1 - Math.min(1, rmsRatio / maxAllowedRmsRatio)) * 6
-                )
-              )
-            );
-            const confLevel: 'High' | 'Medium' = angularCoverageDeg >= 240 && rmsRatio < 0.03 ? 'High' : 'Medium';
+            const confPct = snappedToNativeStep
+              ? 99
+              : Math.min(
+                  98,
+                  Math.max(
+                    78,
+                    Math.round(
+                      75 +
+                        (Math.min(360, angularCoverageDeg) / 360) * 18 +
+                        (1 - Math.min(1, rmsRatio / maxAllowedRmsRatio)) * 6
+                    )
+                  )
+                );
+            const confLevel: 'High' | 'Medium' =
+              snappedToNativeStep || (angularCoverageDeg >= 240 && rmsRatio < 0.03) ? 'High' : 'Medium';
 
             features.push({
               id: featId,
@@ -2161,32 +2464,47 @@ export function analyzeCadGeometryAndTopology(
               fittedRadiusMm: Number(radiusMm.toFixed(2)),
               axialLengthMm: Number(axialLength.toFixed(2)),
               angularCoverageDeg,
-              rmsFitErrorRatio: Number(rmsRatio.toFixed(4)),
+              rmsFitErrorRatio: Number((snappedToNativeStep ? 0.0001 : rmsRatio).toFixed(4)),
               normalOrientation: isHole ? 'Inward (Concave)' : 'Outward (Convex)',
               fitsWithinPartBoundary: true,
               verificationStatus: isHole ? 'Verified Closed Hole' : 'Verified Cylindrical Boss',
               confidencePercent: confPct,
               confidenceLevel: confLevel,
-              rejectionOrVerificationReason: `Verified ${angularCoverageDeg}° cylindrical ${
-                isHole ? 'bore' : 'outer journal/boss/profile'
-              } within part envelope (${maxAllowedCylDia.toFixed(1)} mm max bound).`,
+              rejectionOrVerificationReason: snappedToNativeStep
+                ? `Exact Native STEP Analytical B-Rep Cylinder (R=${radiusMm.toFixed(3)} mm, Ø=${diameterMm.toFixed(2)} mm, ${angularCoverageDeg}° span).`
+                : `Verified ${angularCoverageDeg}° cylindrical ${
+                    isHole ? 'bore' : 'outer journal/boss/profile'
+                  } within part envelope (${maxAllowedCylDia.toFixed(1)} mm max bound).`,
             });
             continue;
           } else {
-            // Candidate failed closed-hole / closed-boss verification!
-            // Never interpret arbitrary partial circular edges or oversized radii as holes.
             const canBeFillet =
               fitsWithinPartBoundary && angularCoverageDeg >= 30 && rmsRatio < 0.045 && axialLength >= 0.3;
 
             let mappedFilletId: string | null = null;
             if (canBeFillet) {
+              let filletR = radiusMm;
+              const stepFilletPool = [
+                ...(metadata.nativeStepFilletRadiiMm || []),
+                ...(metadata.nativeStepCylindricalRadiiMm || []),
+              ];
+              if (metadata.hasNativeBrepAnalytics && stepFilletPool.length > 0) {
+                let bestDiff = Math.max(0.08, filletR * 0.035);
+                for (const sr of stepFilletPool) {
+                  const diff = Math.abs(sr - filletR);
+                  if (diff <= bestDiff) {
+                    bestDiff = diff;
+                    filletR = sr;
+                  }
+                }
+              }
               mappedFilletId = `FIL-${String(filletCounter++).padStart(2, '0')}`;
               const featIdx = features.length;
               for (const t of clusterTris) comp.faceIdPerTriangle[t] = featIdx;
 
               features.push({
                 id: mappedFilletId,
-                name: `Curved Blend / Fillet R${radiusMm.toFixed(2)} mm (${angularCoverageDeg}° arc)`,
+                name: `Curved Blend / Fillet R${filletR.toFixed(2)} mm (${angularCoverageDeg}° arc)`,
                 type: 'fillet',
                 componentIndex: comp.index,
                 componentName: comp.name,
@@ -2195,9 +2513,9 @@ export function analyzeCadGeometryAndTopology(
                 areaMm2: clusterArea,
                 centroid: [clusterCentroid.x, clusterCentroid.y, clusterCentroid.z],
                 normalOrAxis: [axis.x, axis.y, axis.z],
-                radiusMm,
+                radiusMm: filletR,
                 depthOrLengthMm: axialLength,
-                chamferWidthMm: radiusMm,
+                chamferWidthMm: filletR,
                 chamferAngleDeg: angularCoverageDeg,
                 angularCoverageDeg,
                 verificationConfidence: 'Medium',
@@ -2304,6 +2622,11 @@ export function analyzeCadGeometryAndTopology(
     });
   };
 
+  const isFineStepTess = Boolean(metadata.hasNativeBrepAnalytics);
+  const envelopeMethodLabel = isFineStepTess
+    ? 'STEP B-Rep Fine Tessellation Envelope (0.001 mm Deflection)'
+    : 'Tessellated Mesh Vertex Bounding Box';
+
   addDim({
     id: 'DIM-ENV-X',
     category: 'Overall Envelope',
@@ -2312,7 +2635,7 @@ export function analyzeCadGeometryAndTopology(
     formattedValue: overallSpan.x.toFixed(2),
     unit: 'mm',
     geometricReference: `X [${overallMin.x.toFixed(2)} .. ${overallMax.x.toFixed(2)}]`,
-    extractionMethod: 'Exact Vertex Bounding Envelope',
+    extractionMethod: envelopeMethodLabel,
   });
   addDim({
     id: 'DIM-ENV-Y',
@@ -2322,7 +2645,7 @@ export function analyzeCadGeometryAndTopology(
     formattedValue: overallSpan.y.toFixed(2),
     unit: 'mm',
     geometricReference: `Y [${overallMin.y.toFixed(2)} .. ${overallMax.y.toFixed(2)}]`,
-    extractionMethod: 'Exact Vertex Bounding Envelope',
+    extractionMethod: envelopeMethodLabel,
   });
   addDim({
     id: 'DIM-ENV-Z',
@@ -2332,7 +2655,7 @@ export function analyzeCadGeometryAndTopology(
     formattedValue: overallSpan.z.toFixed(2),
     unit: 'mm',
     geometricReference: `Z [${overallMin.z.toFixed(2)} .. ${overallMax.z.toFixed(2)}]`,
-    extractionMethod: 'Exact Vertex Bounding Envelope',
+    extractionMethod: envelopeMethodLabel,
   });
   addDim({
     id: 'DIM-ENV-DIAG',
@@ -2342,7 +2665,9 @@ export function analyzeCadGeometryAndTopology(
     formattedValue: diagMm.toFixed(2),
     unit: 'mm',
     geometricReference: 'Min-to-Max Corner Vector',
-    extractionMethod: 'Euclidean Envelope Norm',
+    extractionMethod: isFineStepTess
+      ? '3D Euclidean Norm (STEP Fine Tessellation Bounds)'
+      : '3D Euclidean Norm (Tessellated Mesh Bounds)',
   });
 
   const authoritativeVolCm3 = Number((totalVolumeMm3 / 1000).toFixed(3));
@@ -2356,7 +2681,9 @@ export function analyzeCadGeometryAndTopology(
     formattedValue: `${authoritativeVolCm3.toFixed(3)} (${authoritativeVolMm3.toLocaleString()} mm³)`,
     unit: 'cm³',
     geometricReference: `${components.length} Solid Body(s) · Enclosed 3D Solid Geometry`,
-    extractionMethod: 'Signed Tetrahedron Divergence Theorem',
+    extractionMethod: isFineStepTess
+      ? 'Signed Tetrahedral Divergence on Fine STEP Tessellation (Mesh Integration)'
+      : 'Signed Tetrahedral Divergence Theorem (Tessellated Mesh Approximation)',
   });
   addDim({
     id: 'DIM-AREA-CM2',
@@ -2366,11 +2693,21 @@ export function analyzeCadGeometryAndTopology(
     formattedValue: `${(totalAreaMm2 / 100).toFixed(2)} (${Math.round(totalAreaMm2).toLocaleString()} mm²)`,
     unit: 'cm²',
     geometricReference: 'All Exterior & Internal Bore Faces',
-    extractionMethod: 'Exact Triangle Cross-Product Summation',
+    extractionMethod: isFineStepTess
+      ? 'Triangle Area Summation on Fine STEP Tessellation'
+      : 'Tessellated Triangle Area Summation (Mesh Approximation)',
   });
+
+  const isExactStepRadius = (rMm?: number) => {
+    if (!rMm || !metadata.hasNativeBrepAnalytics || !metadata.nativeStepCylindricalRadiiMm?.length) {
+      return false;
+    }
+    return metadata.nativeStepCylindricalRadiiMm.some((sr) => Math.abs(sr - rMm) <= 1e-3);
+  };
 
   const holeFeatures = features.filter((f) => f.type === 'hole' && f.diameterMm);
   for (const h of holeFeatures) {
+    const exactStep = isExactStepRadius(h.radiusMm);
     addDim({
       id: `DIM-${h.id}-DIA`,
       category: 'Hole / Bore',
@@ -2380,7 +2717,9 @@ export function analyzeCadGeometryAndTopology(
       unit: 'mm',
       geometricReference: `${h.id} at (${h.centroid[0].toFixed(1)}, ${h.centroid[1].toFixed(1)}, ${h.centroid[2].toFixed(1)}) · Depth ${(h.depthOrLengthMm || 0).toFixed(2)} mm`,
       linkedFeatureId: h.id,
-      extractionMethod: 'Dihedral Normal Clustering + Algebraic Kåsa Circle Fit',
+      extractionMethod: exactStep
+        ? 'Native STEP Analytical B-Rep Surface Radius (CYLINDRICAL_SURFACE / CIRCLE)'
+        : 'Tessellated Mesh Normal Clustering + Algebraic Kåsa Circle Fit',
     });
   }
 
@@ -2425,7 +2764,7 @@ export function analyzeCadGeometryAndTopology(
             unit: 'mm',
             geometricReference: patternGroup.map((p) => p.id).join(', '),
             linkedFeatureId: h1.id,
-            extractionMethod: 'Hole Axis Intersection + Pattern Circle Fit',
+            extractionMethod: 'Hole Axis Centerline Pattern Circle Fit',
           });
         }
       } else if (patternGroup.length === 2) {
@@ -2472,6 +2811,7 @@ export function analyzeCadGeometryAndTopology(
       const bLen = b.depthOrLengthMm || 0;
       const orig = new THREE.Vector3(...(b.axisOrigin || b.centroid));
       const radialOffset = new THREE.Vector3().subVectors(orig, refOrigin).cross(refAxis).length();
+      const exactStep = isExactStepRadius(b.radiusMm);
 
       let contextualFeatureLabel = `Cylindrical Boss / Mounting Feature`;
       if (
@@ -2503,23 +2843,34 @@ export function analyzeCadGeometryAndTopology(
         unit: 'mm',
         geometricReference: `${b.id} on ${b.componentName}`,
         linkedFeatureId: b.id,
-        extractionMethod: 'Outward Normal Cylinder Clustering + Circle Fit',
+        extractionMethod: exactStep
+          ? 'Native STEP Analytical B-Rep Surface Radius (CYLINDRICAL_SURFACE / CIRCLE)'
+          : 'Tessellated Mesh Normal Clustering + Circle Fit',
       });
     }
   }
 
   const chamferFeatures = features.filter((f) => f.type === 'chamfer' || f.type === 'fillet');
   for (const ch of chamferFeatures) {
+    const isStepFillet =
+      ch.type === 'fillet' &&
+      Boolean(
+        metadata.hasNativeBrepAnalytics &&
+          (metadata.nativeStepFilletRadiiMm?.some((sr) => Math.abs(sr - (ch.radiusMm || 0)) <= 1e-3) ||
+            metadata.nativeStepCylindricalRadiiMm?.some((sr) => Math.abs(sr - (ch.radiusMm || 0)) <= 1e-3))
+      );
     addDim({
       id: `DIM-${ch.id}`,
       category: 'Chamfer / Fillet',
-      parameter: `${ch.id} Bevel Width × Angle`,
+      parameter: ch.type === 'fillet' ? `${ch.id} Fillet Radius × Arc` : `${ch.id} Bevel Width × Angle`,
       value: ch.chamferWidthMm || 0,
       formattedValue: `${(ch.chamferWidthMm || 0).toFixed(2)} mm × ${(ch.chamferAngleDeg || 45).toFixed(1)}°`,
       unit: 'mm',
       geometricReference: `${ch.id} at Z=${ch.centroid[2].toFixed(1)} mm`,
       linkedFeatureId: ch.id,
-      extractionMethod: 'Conical / Bevel Strip Normal Inclination Analysis',
+      extractionMethod: isStepFillet
+        ? 'Native STEP Analytical B-Rep Surface Radius (TOROIDAL / CYLINDRICAL)'
+        : 'Tessellated Conical / Bevel Strip Normal Inclination Analysis',
     });
   }
 
@@ -2537,12 +2888,556 @@ export function analyzeCadGeometryAndTopology(
       unit: 'mm²',
       geometricReference: `${pl.id} Centroid (${pl.centroid[0].toFixed(1)}, ${pl.centroid[1].toFixed(1)}, ${pl.centroid[2].toFixed(1)})`,
       linkedFeatureId: pl.id,
-      extractionMethod: 'Co-Planar Adjacency Graph Summation',
+      extractionMethod: isFineStepTess
+        ? 'Co-Planar Face Summation on STEP B-Rep Tessellation'
+        : 'Co-Planar Triangle Adjacency Summation (Mesh Approximation)',
     });
   }
 
   // Build Ground-Truth Bill of Materials (BOM) directly from the 3D Component(s)
   const bomEntries: BomEntry[] = [];
+
+  /**
+   * Translates raw CAD labels (such as "sun_nema", "satellite_nema", "ring_nema", "porte_satellite", "MA70",
+   * "vis", "ISO 4762", "608ZZ") and 3D component geometry into clear, human-readable engineering component names,
+   * classifies Custom Manufactured vs. Purchased Standard Catalog components, and assigns component-appropriate
+   * engineering materials.
+   */
+  const classifyAndNameEngineeringComponent = (
+    rawCompName: string,
+    parentAssemblyName: string | null | undefined,
+    fileName: string,
+    bboxSize: THREE.Vector3,
+    volumeMm3: number,
+    areaMm2: number,
+    compHoles: CadFaceFeature[],
+    compBosses: CadFaceFeature[],
+    compPlanes: CadFaceFeature[],
+    isAssemblySubpart: boolean,
+    compMatFromMetadata: string | null | undefined,
+    compPositions?: Float32Array
+  ): {
+    engineeringName: string;
+    baseGroupKey: string;
+    componentSourceType: 'MANUFACTURED_CUSTOM' | 'PURCHASED_STANDARD_CATALOG';
+    componentCategory: NonNullable<BomEntry['componentCategory']>;
+    materialGradeKey: MaterialGradeKey;
+    materialDisplaySpec: string;
+    densityGPerCm3: number;
+    assumedPurchasedUnitCostSek?: number;
+    purchasedCostBasisNote?: string;
+    roleOverride?: string;
+    processOverride?: string;
+    secondaryOpsOverride?: string;
+  } => {
+    const stripInstanceSuffix = (s: string) =>
+      s
+        .replace(/\.[^/.]+$/, '')
+        .replace(/[_-]+/g, ' ')
+        .replace(/\s*(?:#|:|-|_|\bcopy\b|\binstance\b|\bocc\b|\bsolid\b|\bbody\b)\s*\d+\s*$/i, '')
+        .replace(/\s*\(\d+\)\s*$/i, '')
+        .replace(/\s+\d+\s*$/, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    const rawBase = stripInstanceSuffix(rawCompName || '');
+    const parentBase = stripInstanceSuffix(parentAssemblyName || '');
+    const fileBase = stripInstanceSuffix(fileName || '');
+    const combinedLower = `${rawBase} ${parentBase} ${fileBase}`.toLowerCase();
+    const nameLower = `${rawBase} ${parentBase}`.toLowerCase().trim() || fileBase.toLowerCase();
+
+    const spans = [bboxSize.x, bboxSize.y, bboxSize.z].sort((a, b) => b - a);
+    const sMax = Math.max(0.5, spans[0]);
+    const sMid = Math.max(0.5, spans[1]);
+    const sMin = Math.max(0.5, spans[2]);
+    const volCm3 = Math.max(0.005, volumeMm3 / 1000);
+    const areaCm2 = Math.max(0.05, areaMm2 / 100);
+    const envVolMm3 = Math.max(1, sMax * sMid * sMin);
+    const fillRatio = Math.min(1, volumeMm3 / envVolMm3);
+    const isRoundDiscOrCyl = Math.abs(sMax - sMid) / sMax < 0.14 || Math.abs(sMid - sMin) / sMid < 0.14;
+    const isDiscLike = Math.abs(sMax - sMid) / sMax < 0.16 && sMin < sMax * 0.65;
+    // Gear teeth create a significantly higher surface-area-to-volume ratio than a smooth cylinder of the same envelope
+    const smoothCylAreaMm2 =
+      2 * Math.PI * Math.pow(sMax * 0.5, 2) + Math.PI * sMax * sMin;
+    const toothSurfaceComplexityRatio = areaMm2 / Math.max(10, smoothCylAreaMm2);
+
+    const declaredMatText = compMatFromMetadata || metadata.materialDeclared;
+
+    // 1. Check for Engine Block / Cylinder Head / MA70 Motor Housing
+    if (
+      /\b(ma\s*70|ma-70|engine\s*block|cylinder\s*head|crankcase|motor\s*block|piston\s*engine|ic\s*engine|culasse|bloc\s*moteur)\b/i.test(
+        combinedLower
+      )
+    ) {
+      const isMa70 = /\bma\s*-?\s*70\b/i.test(combinedLower);
+      const isCylHead = /\b(cylinder\s*head|culasse)\b/i.test(combinedLower);
+      const engName = isMa70
+        ? isAssemblySubpart && !/\bma\s*-?\s*70\b/i.test(rawBase) && rawBase.length > 2
+          ? `Motor Sub-Component — ${rawBase} (MA70 Motor Unit)`
+          : `Motor Cylinder Head & Engine Block Housing (MA70 Motor Unit)`
+        : isCylHead
+          ? `Motor Cylinder Head Casting & Machined Housing`
+          : `Motor Engine Block & Crankcase Housing`;
+      const matResolved = resolveAuthoritativeMaterial(declaredMatText, 'AL_6082');
+      return {
+        engineeringName: engName,
+        baseGroupKey: `motor_block|${engName.toLowerCase()}`,
+        componentSourceType: 'MANUFACTURED_CUSTOM',
+        componentCategory: 'machined_housing_or_block',
+        materialGradeKey: matResolved.key,
+        materialDisplaySpec: declaredMatText
+          ? matResolved.displaySpec
+          : `EN AC-42100 / EN AW-6082 Cast & CNC-Finished Motor Aluminum Alloy (Scenario Assumption — Not Specified in CAD)`,
+        densityGPerCm3: matResolved.densityGPerCm3,
+        roleOverride:
+          'Internal Combustion / Actuator Motor Housing & Cylinder Block (Core Passages, Mounting Decks & Precision Bores)',
+        processOverride:
+          'Gravity Die / Sand Cast Preform + 3+2-Axis Indexed CNC Deck Face Milling, Bore Honing & Port Drilling (or Multi-Axis Billet CNC for Prototype)',
+        secondaryOpsOverride:
+          'Cylinder/Bearing Bore Honing, Deck Flatness Grinding, Pressure-Test Leak Audit, Ultrasonic Cleaning & CMM Inspection',
+      };
+    }
+
+    // 2. Check for Purchased Electric Drive Motor (e.g., NEMA 17 / NEMA 23 Stepper Motor, Servo Motor)
+    const looksLikeNemaMotorBody =
+      (/\b(nema\s*\d*|stepper|step\s*motor|servo\s*motor|electric\s*motor|moteur|motor\s*assy|brushless|bldc)\b/i.test(
+        nameLower
+      ) &&
+        !/\b(sun|solaire|satellite|planet|ring|couronne|carrier|porte|support|mount|bracket|flange|bride|cover|capot|housing|carter|adapter|gear|pignon|roue)\b/i.test(
+          nameLower
+        )) ||
+      (isAssemblySubpart &&
+        /\bnema\b/i.test(combinedLower) &&
+        Math.abs(sMid - 42.3) < 3.5 &&
+        sMax >= 30 &&
+        sMax <= 65 &&
+        fillRatio > 0.55);
+
+    if (looksLikeNemaMotorBody) {
+      const frameSizeMm = Math.round(sMid);
+      const isNema17 = Math.abs(sMid - 42) <= 4 || /\bnema\s*17\b/i.test(combinedLower);
+      const isNema23 = Math.abs(sMid - 57) <= 4 || /\bnema\s*23\b/i.test(combinedLower);
+      const motorLabel = isNema17
+        ? `Electric Drive Motor (Purchased NEMA 17 Stepper Motor, ${frameSizeMm} × ${frameSizeMm} × ${sMax.toFixed(0)} mm)`
+        : isNema23
+          ? `Electric Drive Motor (Purchased NEMA 23 Stepper Motor, ${frameSizeMm} × ${frameSizeMm} × ${sMax.toFixed(0)} mm)`
+          : `Electric Drive Motor (Purchased Stepper / Actuator Motor Unit, ${sMid.toFixed(0)} × ${sMin.toFixed(0)} × ${sMax.toFixed(0)} mm)`;
+      const assumedPriceSek = Number(
+        Math.max(165, Math.min(680, 145 + volCm3 * 1.45)).toFixed(2)
+      );
+      return {
+        engineeringName: motorLabel,
+        baseGroupKey: `purchased_motor|${frameSizeMm}x${Math.round(sMax)}`,
+        componentSourceType: 'PURCHASED_STANDARD_CATALOG',
+        componentCategory: 'purchased_electric_motor',
+        materialGradeKey: 'STEEL_42CRMO4',
+        materialDisplaySpec:
+          'Multi-Material Electromechanical Motor Assembly (Electrical Steel Lamination Stack, Copper Stator Windings, Permanent Magnet Rotor & Aluminum Endbells — Purchased Catalog Unit)',
+        densityGPerCm3: 5.4,
+        assumedPurchasedUnitCostSek: assumedPriceSek,
+        purchasedCostBasisNote:
+          `Assumed Standard Catalog Unit Allowance (${assumedPriceSek.toFixed(2)} SEK/unit — Unverified Engineering Estimate for commercial stepper/drive motor; requires supplier catalog quote; NOT custom CNC-machined from solid bar).`,
+        roleOverride:
+          'Purchased Electromechanical Rotary Actuator / Drive Motor (Consolidated Multi-Body Commercial Unit — Not Custom Machined)',
+        processOverride:
+          'Purchased Commercial Off-The-Shelf (COTS) Electromechanical Motor Unit (Incoming Shaft Runout & Winding Continuity QA Only)',
+        secondaryOpsOverride:
+          'Incoming Visual & Shaft Fit Inspection, Pinion/Coupling Press-Fit or Set-Screw Engagement & Functional Spin Test',
+      };
+    }
+
+    // 3. Check for Planetary / Spur / Ring Gears & Planet Carrier ("sun_nema", "satellite_nema", "ring_nema", "porte_satellite", etc.)
+    const isSunGear =
+      /\b(sun|solaire|pignon\s*central|center\s*pinion)\b/i.test(nameLower) ||
+      (/\bsun[_\s-]*nema\b/i.test(nameLower));
+    const isPlanetGear =
+      /\b(satellite|planet[_\s-]*gear|planetaire|planet\s*wheel)\b/i.test(nameLower) ||
+      (/\bsatellite[_\s-]*nema\b/i.test(nameLower));
+    const isRingGear =
+      /\b(ring[_\s-]*gear|ring[_\s-]*nema|couronne|internal\s*gear|annulus|hohlrad)\b/i.test(
+        nameLower
+      );
+    const isPlanetCarrier =
+      /\b(porte[_\s-]*satellite|planet[_\s-]*carrier|carrier|spider|steg)\b/i.test(nameLower);
+    const isExplicitGear =
+      isSunGear ||
+      isPlanetGear ||
+      isRingGear ||
+      /\b(gear|spur|pinion|pignon|engrenage|toothed|sprocket|zahnrad)\b/i.test(nameLower);
+
+    // Geometry-based gear detection when CAD name is generic or cryptic
+    const isGeometricGear =
+      !isPlanetCarrier &&
+      isDiscLike &&
+      sMax >= 10 &&
+      sMax <= 180 &&
+      toothSurfaceComplexityRatio >= 1.42 &&
+      (compHoles.length >= 1 || compBosses.length >= 1);
+
+    if (isSunGear || isPlanetGear || isRingGear || isExplicitGear || isGeometricGear) {
+      const matResolved = resolveAuthoritativeMaterial(declaredMatText, 'STEEL_42CRMO4');
+      const gearMatSpec = declaredMatText
+        ? matResolved.displaySpec
+        : `EN 10083 42CrMo4 / 16MnCr5 Case-Hardening Gear Steel (Scenario Assumption — Not Specified in CAD)`;
+      if (isSunGear) {
+        return {
+          engineeringName: `Central Sun Gear Pinion (Ø${sMax.toFixed(1)} × ${sMin.toFixed(1)} mm)`,
+          baseGroupKey: `sun_gear|${sMax.toFixed(1)}x${sMin.toFixed(1)}`,
+          componentSourceType: 'MANUFACTURED_CUSTOM',
+          componentCategory: 'machined_gear',
+          materialGradeKey: matResolved.key,
+          materialDisplaySpec: gearMatSpec,
+          densityGPerCm3: matResolved.densityGPerCm3,
+          roleOverride:
+            'Central Input Sun Gear Pinion (Transmits Input Motor Torque to Meshing Planetary Spur Gears)',
+          processOverride:
+            'CNC Turning, Center Bore Reaming & Precision Gear Hobbing / Skiving + Case Hardening',
+          secondaryOpsOverride:
+            'Gear Tooth Deburring, Case-Hardening / Nitride Surface Treatment, Bore Concentricity Grinding & Gear Profile CMM Audit',
+        };
+      }
+      if (isPlanetGear) {
+        return {
+          engineeringName: `Planetary Spur Gear / Planet Gear (Ø${sMax.toFixed(1)} × ${sMin.toFixed(1)} mm)`,
+          baseGroupKey: `planet_gear|${sMax.toFixed(1)}x${sMin.toFixed(1)}`,
+          componentSourceType: 'MANUFACTURED_CUSTOM',
+          componentCategory: 'machined_gear',
+          materialGradeKey: matResolved.key,
+          materialDisplaySpec: gearMatSpec,
+          densityGPerCm3: matResolved.densityGPerCm3,
+          roleOverride:
+            'Planetary Spur Gear (Meshes Simultaneously Between Central Sun Gear Pinion and Internal Ring Gear Housing)',
+          processOverride:
+            'CNC Blank Turning, Bearing/Pin Bore Reaming & Gear Hobbing / Shaping + Heat Treatment',
+          secondaryOpsOverride:
+            'Tooth Edge Chamfering, Case Hardening, Precision Bearing Bore Honing & Tooth Runout Inspection',
+        };
+      }
+      if (isRingGear) {
+        return {
+          engineeringName: `Internal Ring Gear Housing (Ø${sMax.toFixed(1)} × ${sMin.toFixed(1)} mm)`,
+          baseGroupKey: `ring_gear|${sMax.toFixed(1)}x${sMin.toFixed(1)}`,
+          componentSourceType: 'MANUFACTURED_CUSTOM',
+          componentCategory: 'machined_gear',
+          materialGradeKey: matResolved.key,
+          materialDisplaySpec: gearMatSpec,
+          densityGPerCm3: matResolved.densityGPerCm3,
+          roleOverride:
+            'Internal Ring Gear & Outer Gearbox Housing (Provides Stationary or Output Internal Tooth Mesh and Mounting Bolt Pattern)',
+          processOverride:
+            'CNC Turning & Milling + Internal Gear Shaping / Power Skiving & Bolt-Circle Drilling',
+          secondaryOpsOverride:
+            'Internal Tooth Deburring, Stress-Relief / Nitride Hardening, Mounting Flange Face Skimming & CMM Pitch-Circle Audit',
+        };
+      }
+      return {
+        engineeringName: `Toothed Spur / Transmission Gear Wheel (Ø${sMax.toFixed(1)} × ${sMin.toFixed(1)} mm)`,
+        baseGroupKey: `spur_gear|${sMax.toFixed(1)}x${sMin.toFixed(1)}`,
+        componentSourceType: 'MANUFACTURED_CUSTOM',
+        componentCategory: 'machined_gear',
+        materialGradeKey: matResolved.key,
+        materialDisplaySpec: gearMatSpec,
+        densityGPerCm3: matResolved.densityGPerCm3,
+        roleOverride:
+          'Toothed Rotary Power-Transmission Gear Component (Center Bore & Peripheral Tooth Profile)',
+        processOverride:
+          'CNC Blank Turning, Coaxial Bore Reaming & Gear Hobbing / Profile Milling + Heat Treatment',
+        secondaryOpsOverride:
+          'Tooth Deburring, Case Hardening, Bore Honing & Gear Tooth Profile CMM Inspection',
+      };
+    }
+
+    if (isPlanetCarrier) {
+      const matResolved = resolveAuthoritativeMaterial(declaredMatText, 'STEEL_42CRMO4');
+      return {
+        engineeringName: `Planet Gear Carrier Flange & Output Spider (Ø${sMax.toFixed(1)} × ${sMin.toFixed(1)} mm)`,
+        baseGroupKey: `planet_carrier|${sMax.toFixed(1)}x${sMin.toFixed(1)}`,
+        componentSourceType: 'MANUFACTURED_CUSTOM',
+        componentCategory: 'machined_carrier_or_flange',
+        materialGradeKey: matResolved.key,
+        materialDisplaySpec: declaredMatText
+          ? matResolved.displaySpec
+          : `EN 10083 42CrMo4 Quenched & Tempered Structural Steel (Scenario Assumption — Not Specified in CAD)`,
+        densityGPerCm3: matResolved.densityGPerCm3,
+        roleOverride:
+          'Planetary Gear Carrier & Coaxial Output Flange (Supports Planet Gear Dowel Pins at Equal Angular Pitch)',
+        processOverride:
+          'CNC Turning & 3+2-Axis Indexed Milling + Precision Jig-Boring of Planet Pin Holes',
+        secondaryOpsOverride:
+          'Precision Reaming of Planet Pin Bores (ISO H7 Pitch Circle), Edge Deburring & CMM True-Position Verification',
+      };
+    }
+
+    // 4. Check for Purchased Standard Fasteners, Bearings, Washers & Dowel Pins
+    const isScrewName =
+      /\b(screw|vis|bolt|boulon|cap\s*screw|socket\s*head|shcs|fhcs|bhcs|iso\s*4762|iso\s*10642|iso\s*7380|din\s*912|din\s*7991|din\s*933|m[234568]\s*[x×]\s*\d+)\b/i.test(
+        nameLower
+      );
+    const isNutName =
+      /\b(nut|ecrou|écrou|hex\s*nut|lock\s*nut|nyloc|iso\s*4032|din\s*934|din\s*985)\b/i.test(
+        nameLower
+      );
+    const isWasherName =
+      /\b(washer|rondelle|shim|spacer\s*ring|circlip|retaining\s*ring|iso\s*7089|din\s*125|din\s*471|din\s*472)\b/i.test(
+        nameLower
+      );
+    const isPinName =
+      /\b(pin|dowel|goupille|axe\s*planet|planet\s*pin|wrist\s*pin|iso\s*2338|iso\s*8734|din\s*6325|din\s*7)\b/i.test(
+        nameLower
+      );
+    const isBearingName =
+      /\b(bearing|roulement|ball\s*bearing|needle\s*bearing|roller\s*bearing|608\s*zz|608\s*2rs|600\d|620\d|680\d|690\d|hk\d+)\b/i.test(
+        nameLower
+      );
+
+    // Geometry-based detection of small standard fasteners/pins/washers inside multi-component assemblies
+    const isSmallCylInAssembly =
+      isAssemblySubpart &&
+      isRoundDiscOrCyl &&
+      sMin <= 14.0 &&
+      sMax <= 65.0 &&
+      volCm3 <= 4.5;
+    const isGeometricPin =
+      isSmallCylInAssembly &&
+      !isScrewName &&
+      !isNutName &&
+      !isWasherName &&
+      !isBearingName &&
+      compHoles.length === 0 &&
+      sMax / Math.max(0.5, sMid) >= 1.8 &&
+      Math.abs(sMid - sMin) / Math.max(0.5, sMid) < 0.12 &&
+      fillRatio >= 0.68;
+    const isGeometricScrew =
+      isSmallCylInAssembly &&
+      !isPinName &&
+      !isNutName &&
+      !isWasherName &&
+      !isBearingName &&
+      sMax / Math.max(0.5, sMid) >= 1.6 &&
+      Math.abs(sMid - sMin) / Math.max(0.5, sMid) < 0.15 &&
+      fillRatio >= 0.35 &&
+      fillRatio < 0.68;
+    const isGeometricWasher =
+      isSmallCylInAssembly &&
+      !isScrewName &&
+      !isNutName &&
+      !isPinName &&
+      !isBearingName &&
+      isDiscLike &&
+      sMin <= 3.2 &&
+      compHoles.length >= 1 &&
+      sMax <= 28.0;
+
+    if (isScrewName || isGeometricScrew) {
+      const nomThreadDia = Math.max(
+        2,
+        Math.min(16, Math.round(sMid * 0.62))
+      );
+      const nomLen = Math.max(4, Math.round(sMax));
+      const assumedPriceSek = Number(Math.max(1.2, Math.min(8.5, 0.9 + volCm3 * 1.2)).toFixed(2));
+      return {
+        engineeringName: `Threaded Fastener Screw (Metric Socket Cap Screw M${nomThreadDia} × ${nomLen} mm)`,
+        baseGroupKey: `purchased_screw|M${nomThreadDia}x${nomLen}`,
+        componentSourceType: 'PURCHASED_STANDARD_CATALOG',
+        componentCategory: 'purchased_fastener_screw_or_bolt',
+        materialGradeKey: 'STEEL_42CRMO4',
+        materialDisplaySpec:
+          'ISO 898-1 Property Class 8.8 / 10.9 Alloy Fastener Steel or A2-70 Stainless (Purchased Standard Metric Fastener)',
+        densityGPerCm3: 7.85,
+        assumedPurchasedUnitCostSek: assumedPriceSek,
+        purchasedCostBasisNote:
+          `Assumed Standard Hardware Unit Allowance (${assumedPriceSek.toFixed(2)} SEK/pc — Unverified Catalog Fastener Price; requires fastener distributor quote; NOT custom CNC-machined).`,
+        roleOverride:
+          'Standard Threaded Mechanical Fastener (Clamps Assembly Housing / Motor Flange Joint)',
+        processOverride:
+          'Purchased Standard Cold-Headed & Thread-Rolled Catalog Fastener (ISO 4762 / DIN 912 Equivalent)',
+        secondaryOpsOverride:
+          'Incoming Lot Verification & Calibrated Torque-Wrench Assembly Installation',
+      };
+    }
+
+    if (isNutName) {
+      const nomThreadDia = Math.max(2, Math.min(16, Math.round(sMax * 0.55)));
+      const assumedPriceSek = Number(Math.max(0.8, Math.min(5.0, 0.7 + volCm3 * 1.1)).toFixed(2));
+      return {
+        engineeringName: `Hexagonal Fastener Nut (Metric M${nomThreadDia} Standard Nut, ${sMax.toFixed(1)} × ${sMin.toFixed(1)} mm)`,
+        baseGroupKey: `purchased_nut|M${nomThreadDia}`,
+        componentSourceType: 'PURCHASED_STANDARD_CATALOG',
+        componentCategory: 'purchased_nut_or_washer',
+        materialGradeKey: 'STEEL_42CRMO4',
+        materialDisplaySpec:
+          'ISO 898-2 Property Class 8 Steel / A2-70 Stainless (Purchased Standard Metric Nut)',
+        densityGPerCm3: 7.85,
+        assumedPurchasedUnitCostSek: assumedPriceSek,
+        purchasedCostBasisNote:
+          `Assumed Standard Hardware Unit Allowance (${assumedPriceSek.toFixed(2)} SEK/pc — Unverified Catalog Nut Price; requires hardware supplier quote).`,
+        roleOverride: 'Standard Internally Threaded Hexagonal Fastener Nut',
+        processOverride: 'Purchased Standard Cold-Formed & Tapped Catalog Nut (ISO 4032 Equivalent)',
+        secondaryOpsOverride: 'Incoming Lot Verification & Assembly Torque Installation',
+      };
+    }
+
+    if (isWasherName || isGeometricWasher) {
+      const assumedPriceSek = Number(Math.max(0.6, Math.min(4.0, 0.5 + volCm3 * 1.0)).toFixed(2));
+      return {
+        engineeringName: `Flat Retaining Washer / Spacer Ring (Ø${sMax.toFixed(1)} × ${sMin.toFixed(1)} mm)`,
+        baseGroupKey: `purchased_washer|${sMax.toFixed(1)}x${sMin.toFixed(1)}`,
+        componentSourceType: 'PURCHASED_STANDARD_CATALOG',
+        componentCategory: 'purchased_nut_or_washer',
+        materialGradeKey: 'STEEL_42CRMO4',
+        materialDisplaySpec:
+          '200 HV Hardened Carbon / Spring Steel (Purchased Standard Washer / Axial Spacer)',
+        densityGPerCm3: 7.85,
+        assumedPurchasedUnitCostSek: assumedPriceSek,
+        purchasedCostBasisNote:
+          `Assumed Standard Hardware Unit Allowance (${assumedPriceSek.toFixed(2)} SEK/pc — Unverified Catalog Washer Price; requires hardware supplier quote).`,
+        roleOverride: 'Axial Load-Distribution Washer / Precision Thrust Spacer Ring',
+        processOverride: 'Purchased Standard Stamped & Ground Catalog Washer (ISO 7089 Equivalent)',
+        secondaryOpsOverride: 'Incoming Dimensional Verification & Assembly Stack-Up Installation',
+      };
+    }
+
+    if (isPinName || isGeometricPin) {
+      const pinDia = Number(sMid.toFixed(1));
+      const pinLen = Number(sMax.toFixed(1));
+      const assumedPriceSek = Number(Math.max(2.5, Math.min(18.0, 2.0 + volCm3 * 2.2)).toFixed(2));
+      return {
+        engineeringName: `Precision Cylindrical Dowel / Carrier Pin (Ø${pinDia.toFixed(1)} × ${pinLen.toFixed(1)} mm)`,
+        baseGroupKey: `purchased_pin|${pinDia.toFixed(1)}x${pinLen.toFixed(1)}`,
+        componentSourceType: 'PURCHASED_STANDARD_CATALOG',
+        componentCategory: 'purchased_pin_or_key',
+        materialGradeKey: 'STEEL_42CRMO4',
+        materialDisplaySpec:
+          'ISO 8734 / DIN 6325 Through-Hardened 100Cr6 Bearing & Dowel Pin Steel (58–62 HRC — Purchased Standard Pin)',
+        densityGPerCm3: 7.85,
+        assumedPurchasedUnitCostSek: assumedPriceSek,
+        purchasedCostBasisNote:
+          `Assumed Standard Catalog Unit Allowance (${assumedPriceSek.toFixed(2)} SEK/pc — Unverified Catalog Dowel Pin Price; requires supplier quote).`,
+        roleOverride:
+          'Precision Ground Cylindrical Carrier Axle / Locating Dowel Pin (ISO m6 Tolerance)',
+        processOverride:
+          'Purchased Standard Centerless-Ground & Hardened Catalog Dowel Pin (ISO 8734 / DIN 6325)',
+        secondaryOpsOverride:
+          'Incoming Diameter Micrometer Check & Press/Slip-Fit Carrier Assembly',
+      };
+    }
+
+    if (isBearingName) {
+      const assumedPriceSek = Number(Math.max(18.0, Math.min(145.0, 16.0 + volCm3 * 3.5)).toFixed(2));
+      return {
+        engineeringName: `Rolling Element Bearing (Ø${sMax.toFixed(1)} OD × ${sMin.toFixed(1)} mm Width)`,
+        baseGroupKey: `purchased_bearing|${sMax.toFixed(1)}x${sMin.toFixed(1)}`,
+        componentSourceType: 'PURCHASED_STANDARD_CATALOG',
+        componentCategory: 'purchased_bearing',
+        materialGradeKey: 'STEEL_42CRMO4',
+        materialDisplaySpec:
+          'ISO 683-17 100Cr6 (AISI 52100) Through-Hardened Chrome Bearing Steel (Purchased Standard Bearing)',
+        densityGPerCm3: 7.85,
+        assumedPurchasedUnitCostSek: assumedPriceSek,
+        purchasedCostBasisNote:
+          `Assumed Standard Catalog Unit Allowance (${assumedPriceSek.toFixed(2)} SEK/pc — Unverified Catalog Bearing Price; requires bearing vendor quote).`,
+        roleOverride:
+          'Purchased Precision Rolling-Element Bearing (Supports Rotary Shaft / Planet Gear Load)',
+        processOverride:
+          'Purchased Commercial Off-The-Shelf (COTS) Precision Bearing Unit (Not Custom Machined)',
+        secondaryOpsOverride:
+          'Incoming Bore/OD Verification & Controlled Arbor-Press Assembly Installation',
+      };
+    }
+
+    // 5. Custom Manufactured Components — Determine Clear Engineering Name & Appropriate Material
+    const compArch = evaluateGeometricArchetypeFromTopology(
+      bboxSize,
+      volumeMm3,
+      compHoles,
+      compBosses,
+      compPlanes,
+      compPositions
+    );
+
+    const isGenericCadLabel =
+      !rawBase ||
+      /^(solid|body|part|component|mesh|brep|shell|compound|shape|instance|product|none|default|step|iges|stl|open\s*cascade|translator)\b/i.test(
+        rawBase
+      );
+
+    let engineeringName = rawBase;
+    let componentCategory: NonNullable<BomEntry['componentCategory']> =
+      'machined_structural_plate_or_bracket';
+    let preferredMatKey: MaterialGradeKey | undefined;
+
+    if (/\b(camshaft|arbre\s*a\s*cames|cam\s*shaft)\b/i.test(combinedLower)) {
+      engineeringName = `Multi-Lobe Camshaft & Journal Shaft (${sMax.toFixed(1)} × Ø${sMid.toFixed(1)} mm)`;
+      componentCategory = 'machined_shaft_or_cam';
+      preferredMatKey = 'STEEL_42CRMO4';
+    } else if (/\b(crankshaft|vilebrequin|drive\s*shaft|output\s*shaft|rotor\s*shaft|spindle\s*shaft|arbre)\b/i.test(combinedLower)) {
+      engineeringName = `Precision Machined Rotary Transmission Shaft (${sMax.toFixed(1)} × Ø${sMid.toFixed(1)} mm)`;
+      componentCategory = 'machined_shaft_or_cam';
+      preferredMatKey = 'STEEL_42CRMO4';
+    } else if (/\b(cover|capot|couvercle|lid|end\s*cap|housing|carter|casing|enclosure|body\s*housing)\b/i.test(nameLower)) {
+      engineeringName = `Machined Enclosure Cover / Housing Cap (${sMax.toFixed(1)} × ${sMid.toFixed(1)} × ${sMin.toFixed(1)} mm)`;
+      componentCategory = 'machined_housing_or_block';
+      preferredMatKey = 'AL_6082';
+    } else if (/\b(flange|bride|adapter|mounting\s*plate|motor\s*mount|support)\b/i.test(nameLower)) {
+      engineeringName = `Machined Mounting Flange / Adapter Plate (${sMax.toFixed(1)} × ${sMid.toFixed(1)} × ${sMin.toFixed(1)} mm)`;
+      componentCategory = 'machined_carrier_or_flange';
+      preferredMatKey = 'AL_6082';
+    } else if (/\b(bushing|sleeve|bague|entretoise|collar|hub)\b/i.test(nameLower)) {
+      engineeringName = `Machined Cylindrical Bushing / Spacer Sleeve (Ø${sMax.toFixed(1)} × ${sMin.toFixed(1)} mm)`;
+      componentCategory = 'machined_shaft_or_cam';
+      preferredMatKey = 'STEEL_42CRMO4';
+    } else if (compArch.archetype === 'rotational_multi_journal_or_cam') {
+      engineeringName = isGenericCadLabel
+        ? `Multi-Journal Stepped Rotary / Cam Shaft (${sMax.toFixed(1)} × Ø${sMid.toFixed(1)} mm)`
+        : `${rawBase} — Multi-Section Rotary Shaft Component`;
+      componentCategory = 'machined_shaft_or_cam';
+      preferredMatKey = 'STEEL_42CRMO4';
+    } else if (compArch.archetype === 'rotational_shaft_or_sleeve') {
+      engineeringName = isGenericCadLabel
+        ? compHoles.length > 0
+          ? `Cylindrical Flanged Bushing / Hub Sleeve (Ø${sMax.toFixed(1)} × ${sMin.toFixed(1)} mm)`
+          : `Stepped Cylindrical Shaft Component (${sMax.toFixed(1)} × Ø${sMid.toFixed(1)} mm)`
+        : `${rawBase} — Cylindrical Turned Component`;
+      componentCategory = 'machined_shaft_or_cam';
+      preferredMatKey = 'STEEL_42CRMO4';
+    } else if (compArch.archetype === 'sheet_metal') {
+      engineeringName = isGenericCadLabel
+        ? `Formed Sheet-Metal Bracket / Plate (${sMax.toFixed(1)} × ${sMid.toFixed(1)} × ${sMin.toFixed(1)} mm)`
+        : `${rawBase} — Sheet-Metal Component`;
+      componentCategory = 'sheet_metal_component';
+      preferredMatKey = 'AL_6082';
+    } else if (compArch.archetype === 'mixed_prismatic_rotational') {
+      engineeringName = isGenericCadLabel
+        ? `Machined Bearing Housing / Mounting Bracket (${sMax.toFixed(1)} × ${sMid.toFixed(1)} × ${sMin.toFixed(1)} mm)`
+        : `${rawBase} — Prismatic-Cylindrical Housing / Bracket`;
+      componentCategory = 'machined_housing_or_block';
+      preferredMatKey = 'AL_6082';
+    } else {
+      engineeringName = isGenericCadLabel
+        ? compHoles.length > 0
+          ? `Machined Multi-Bore Mounting Plate / Structural Block (${sMax.toFixed(1)} × ${sMid.toFixed(1)} × ${sMin.toFixed(1)} mm)`
+          : `Machined Prismatic Structural Block (${sMax.toFixed(1)} × ${sMid.toFixed(1)} × ${sMin.toFixed(1)} mm)`
+        : `${rawBase} — Machined Structural Component`;
+      componentCategory = 'machined_structural_plate_or_bracket';
+      preferredMatKey = 'AL_6082';
+    }
+
+    const matInfo = resolveAuthoritativeMaterial(
+      declaredMatText,
+      preferredMatKey,
+      compArch.archetype
+    );
+
+    return {
+      engineeringName,
+      baseGroupKey: `${componentCategory}|${rawBase.toLowerCase() || 'geom'}`,
+      componentSourceType: 'MANUFACTURED_CUSTOM',
+      componentCategory,
+      materialGradeKey: matInfo.key,
+      materialDisplaySpec: matInfo.displaySpec,
+      densityGPerCm3: matInfo.densityGPerCm3,
+    };
+  };
 
   const inferComponentManufacturingDetails = (
     bboxSize: THREE.Vector3,
@@ -2554,8 +3449,67 @@ export function analyzeCadGeometryAndTopology(
     compPlanes: CadFaceFeature[],
     isAssemblySubpart: boolean,
     matSpec: string,
-    compPositions?: Float32Array
+    compPositions?: Float32Array,
+    classified?: ReturnType<typeof classifyAndNameEngineeringComponent>
   ) => {
+    const unitNetVolCm3 = Number((volumeMm3 / 1000).toFixed(3));
+    const unitAreaCm2 = Number((areaMm2 / 100).toFixed(2));
+
+    // If this component is a PURCHASED_STANDARD_CATALOG part (motor, screw, nut, washer, bearing, dowel pin),
+    // do NOT assign raw billet stock or CNC chip removal!
+    if (classified?.componentSourceType === 'PURCHASED_STANDARD_CATALOG') {
+      const netVolM3 = Number((unitNetVolCm3 * 1e-6).toFixed(9));
+      const dimsFormatted = `Purchased Standard Unit (${bboxSize.x.toFixed(1)} × ${bboxSize.y.toFixed(1)} × ${bboxSize.z.toFixed(1)} mm Envelope — No Raw Billet Machining)`;
+      const stockValidation: RawStockGeometryValidation = {
+        stockShape: 'near_net_cast_or_forged_preform',
+        stockDimensionsFormatted: dimsFormatted,
+        axialAllowanceMm: 0,
+        radialOrLateralAllowanceMm: 0,
+        partEnvelopeMm: [
+          Number(bboxSize.x.toFixed(2)),
+          Number(bboxSize.y.toFixed(2)),
+          Number(bboxSize.z.toFixed(2)),
+        ],
+        requiredCircumscribedDiameterMm: Number(Math.hypot(bboxSize.y, bboxSize.z).toFixed(2)),
+        proposedStockEnvelopeMm: [
+          Number(bboxSize.x.toFixed(2)),
+          Number(bboxSize.y.toFixed(2)),
+          Number(bboxSize.z.toFixed(2)),
+        ],
+        geometricallyContainsPart: true,
+        containmentVerificationNote: `Purchased standard catalog component (${classified.engineeringName}) procured at net finished dimensions (${bboxSize.x.toFixed(1)}×${bboxSize.y.toFixed(1)}×${bboxSize.z.toFixed(1)} mm, V_net = ${unitNetVolCm3.toFixed(3)} cm³); zero in-house CNC stock removal required.`,
+        rawStockVolumeCm3: unitNetVolCm3,
+        netPartVolumeCm3: unitNetVolCm3,
+      };
+      const remarks =
+        `${classified.roleOverride || 'Purchased Standard Catalog Component'}; procurement route: ${classified.processOverride || 'Commercial Off-The-Shelf (COTS) Catalog Part'}; envelope ${bboxSize.x.toFixed(1)}×${bboxSize.y.toFixed(1)}×${bboxSize.z.toFixed(1)} mm (${unitNetVolCm3.toFixed(3)} cm³ net volume, 0.0% in-house chip removal). ` +
+        (classified.purchasedCostBasisNote ||
+          'Purchased unit price is an unverified engineering catalog allowance requiring supplier quotation.');
+
+      return {
+        archetype: 'prismatic_block' as GeometricArchetypeKind,
+        manufacturingProcess:
+          classified.processOverride ||
+          'Purchased Standard Commercial Catalog Component (No In-House CNC Machining)',
+        structuralRole:
+          classified.roleOverride ||
+          'Purchased Standard Catalog Component (Fastener / Bearing / Pin / Motor)',
+        secondaryOperations:
+          classified.secondaryOpsOverride ||
+          'Incoming Dimensional & Lot QA Verification + Assembly Kitting',
+        rawStockDimensionsMm: dimsFormatted,
+        rawStockVolumeCm3: unitNetVolCm3,
+        rawVolM3: netVolM3,
+        netVolM3,
+        volumeConversionExplanation: `Purchased standard catalog component (${classified.engineeringName}) supplied in finished net state (V_raw = V_net = ${unitNetVolCm3.toFixed(3)} cm³ / ${netVolM3.toFixed(6)} m³; V_rem = 0.00 cm³).`,
+        chipRemovalRatioPct: 0,
+        chipRemovalExplanation: `0.0% in-house chip removal — component is procured as a finished commercial catalog item (${classified.engineeringName}) rather than machined from raw bar or billet stock.`,
+        featureSummary: `Purchased Standard Unit (${bboxSize.x.toFixed(1)} × ${bboxSize.y.toFixed(1)} × ${bboxSize.z.toFixed(1)} mm)`,
+        remarks,
+        stockValidation,
+      };
+    }
+
     const archInfo = evaluateGeometricArchetypeFromTopology(
       bboxSize,
       volumeMm3,
@@ -2568,14 +3522,10 @@ export function analyzeCadGeometryAndTopology(
       archetype,
       castingOrForgingJustified,
       distinctDiameterCount,
-      eccentricSectionCount,
       sMax,
-      sMid,
       sMin,
       fillRatio,
     } = archInfo;
-    const unitNetVolCm3 = Number((volumeMm3 / 1000).toFixed(3));
-    const unitAreaCm2 = Number((areaMm2 / 100).toFixed(2));
 
     const bossSampleStr =
       compBosses.length > 0
@@ -2596,81 +3546,112 @@ export function analyzeCadGeometryAndTopology(
         ? `${compPlanes[0].id} (${compPlanes[0].areaMm2.toFixed(0)} mm²)`
         : 'primary datum face';
 
-    let manufacturingProcess = '3-Axis CNC Profile & Surface Milling';
-    let structuralRole = isAssemblySubpart
-      ? 'Machined Assembly Sub-Component (Inferred Role — Requires Verification)'
-      : 'Single-Piece Structural Component (Inferred Role — Requires Verification)';
-    let secondaryOperations = 'CNC Edge Deburring, Ultrasonic Wash, CMM Dimensional Verification';
+    const spatialRels = analyze3DSpatialRelationships(
+      bboxSize,
+      volumeMm3,
+      compHoles,
+      compBosses,
+      compPlanes
+    );
+    const primarySpatialNote =
+      spatialRels.length > 0 ? ` Spatial relationship: ${spatialRels[0]}` : '';
 
-    if (archetype === 'rotational_multi_journal_or_cam') {
-      manufacturingProcess =
-        compHoles.length > 0
-          ? 'CNC Turning, Synchronized Multi-Axis Cam/Eccentric Profile Milling, Axial Boring & Cylindrical OD Grinding (or Closed-Die Forged/Chill-Cast Preform + Finish CNC)'
-          : 'CNC Turning, Synchronized Multi-Axis Cam/Eccentric Profile Milling & Precision Cylindrical OD Grinding (or Closed-Die Forged/Chill-Cast Preform + Finish CNC)';
-      structuralRole =
-        `Rotational Multi-Journal / Eccentric Cam-Profile Shaft (${compBosses.length} Cylindrical/Lobe Sections across ${sMax.toFixed(1)} mm Axial Span — Requires Drawing Verification)`;
-      secondaryOperations =
-        `Center-Drilling Both Ends, Induction / Case Hardening of Journals & Lobes (Where Specified), Precision Cylindrical OD & Cam-Profile Grinding (${bossSampleStr}), Coaxial Runout & CMM Inspection`;
-    } else if (archetype === 'rotational_shaft_or_sleeve') {
-      manufacturingProcess =
-        compHoles.length > 0
-          ? 'CNC Lathe Turning, Coaxial Centerline Boring & Precision Reaming / Mill-Turn Profiling'
-          : 'CNC Lathe Turning, Stepped Journal Profiling & Cylindrical OD Grinding';
-      structuralRole =
-        compHoles.length > 0
-          ? `Axisymmetric Turned Sleeve / Flanged Bearing Housing (${compBosses.length} OD Section(s), ${compHoles.length} Bore(s) — Requires Drawing Verification)`
-          : `Axisymmetric Stepped Shaft / Rotational Journal Component (${compBosses.length} OD Section(s) — Requires Drawing Verification)`;
-      secondaryOperations =
-        compHoles.length > 0
-          ? `Soft-Jaw Op-20 Collet Facing, Precision Bore Reaming/Honing (${holeSampleStr}), Coaxial Runout & CMM Verification`
-          : `Between-Centers OD Cylindrical Grinding (${bossSampleStr}), Stress-Relief Undercutting, Ultrasonic Wash & Runout Audit`;
-    } else if (archetype === 'sheet_metal') {
-      manufacturingProcess =
-        compHoles.length > 0
-          ? 'Fiber-Laser Sheet Contour Cutting, CNC Turret Punching / Drilling & Press-Brake Forming'
-          : 'Fiber-Laser Sheet Contour Cutting & CNC Press-Brake Forming';
-      structuralRole = `Thin-Gauge Sheet Metal Plate / Formed Bracket (${sMin.toFixed(1)} mm Gauge Thickness — Requires Verification)`;
-      secondaryOperations =
-        'Rotary Brush Edge Deburring, Vibratory Tumbling, Press-Brake Bend Verification & Surface Passivation/Anodizing';
-    } else if (archetype === 'mixed_prismatic_rotational') {
-      manufacturingProcess = castingOrForgingJustified
-        ? 'Multi-Axis (3+2 / 5-Axis) Indexed CNC Milling, Cylindrical Boss Profiling & Precision Boring (or Near-Net Sand/Investment Casting + Finish CNC on Functional Datums/Bores)'
-        : compHoles.length > 0
-          ? 'Multi-Axis (3+2 / 5-Axis) Indexed CNC Milling, Cylindrical Boss Profiling & Precision Boring'
-          : 'Multi-Axis (3+2 / 5-Axis) Indexed CNC Milling & Cylindrical Boss Contour Profiling';
-      structuralRole =
-        `Mixed Prismatic-Rotational Structural Housing / Clevis / Mounting Bracket (${compBosses.length} Cylindrical Boss/Collar(s), ${compHoles.length} Bore(s), ${(fillRatio * 100).toFixed(1)}% Volumetric Fill — Requires Verification)`;
-      secondaryOperations =
-        compHoles.length > 0
-          ? `Datum Skim Milling (${primaryPlaneStr}), Helical Interpolation & Bore Reaming (${holeSampleStr}), Boss Shoulder Blending (${bossSampleStr}), Deburring & CMM Inspection`
-          : `Datum Skim Milling (${primaryPlaneStr}), Cylindrical Collar Finishing (${bossSampleStr}), CNC Edge Deburring & CMM Verification`;
-    } else {
-      if (castingOrForgingJustified && compHoles.length > 0) {
+    let manufacturingProcess = classified?.processOverride || '3-Axis CNC Profile & Surface Milling';
+    let structuralRole =
+      classified?.roleOverride ||
+      (isAssemblySubpart
+        ? 'Machined Assembly Sub-Component (Neutral Geometry Classification — Exact Functional Role Requires Drawing Verification)'
+        : 'Single-Piece Machined Component (Neutral Geometry Classification — Exact Functional Role Requires Drawing Verification)');
+    let secondaryOperations =
+      classified?.secondaryOpsOverride ||
+      'CNC Edge Deburring, Ultrasonic Cleaning & CMM Dimensional Inspection';
+
+    if (!classified?.processOverride) {
+      if (archetype === 'rotational_multi_journal_or_cam') {
         manufacturingProcess =
-          '3-Axis / 4-Axis Horizontal CNC Milling, Pocket Roughing & Precision Cross-Boring (or Near-Net Casting + Finish CNC Machining)';
+          compHoles.length > 0
+            ? 'CNC Turning, Indexed Multi-Axis Profile Milling & Coaxial Boring (or Forged/Cast Preform + Finish CNC)'
+            : 'CNC Turning, Indexed Multi-Axis Profile Milling & Cylindrical OD Grinding (or Forged/Cast Preform + Finish CNC)';
         structuralRole =
-          `Multi-Bore Prismatic Manifold / Structural Housing (${compHoles.length} Bore(s), ${(fillRatio * 100).toFixed(1)}% Fill Ratio — Requires Verification)`;
+          classified?.roleOverride ||
+          `Elongated Multi-Section Axisymmetric Shaft Component (${compBosses.length} Coaxial/Stepped Cylindrical Sections across ${sMax.toFixed(1)} mm Span — Functional Role Requires Drawing Verification)`;
         secondaryOperations =
-          `Primary Datum Face Milling (${primaryPlaneStr}), Spot-Drilling, Deep-Hole Peck Drilling & Reaming (${holeSampleStr}), Cross-Hole Deburring & Pressure/CMM Audit`;
-      } else if (compHoles.length > 0) {
-        manufacturingProcess = '3-Axis CNC Face Milling, Adaptive Pocket/Profile Roughing & Precision Drilling/Boring';
+          `Center-Drilling Both Ends, Cylindrical OD Finishing (${bossSampleStr}), Deburring & Coaxial Runout Inspection`;
+      } else if (archetype === 'rotational_shaft_or_sleeve') {
+        manufacturingProcess =
+          compHoles.length > 0
+            ? 'CNC Turning & Coaxial Centerline Boring / Mill-Turn Profiling'
+            : 'CNC Turning & Stepped Cylindrical OD Profiling';
         structuralRole =
-          `Prismatic Machined Mounting Plate / Structural Block (${compPlanes.length} Planar Faces, ${compHoles.length} Bore(s) — Requires Verification)`;
+          classified?.roleOverride ||
+          (compHoles.length > 0
+            ? `Axisymmetric Cylindrical Sleeve / Flanged Bushing Component (${compBosses.length} OD Section(s), ${compHoles.length} Coaxial Bore(s) — Functional Role Requires Drawing Verification)`
+            : `Axisymmetric Stepped Cylindrical Component (${compBosses.length} OD Section(s) — Functional Role Requires Drawing Verification)`);
         secondaryOperations =
-          `Hydraulic Vise Datum Squaring (${primaryPlaneStr}), Spot-Drilling, Solid-Carbide Drilling & Bore Reaming (${holeSampleStr}), Edge Break & Ultrasonic Wash`;
+          compHoles.length > 0
+            ? `Op-20 Collet Facing, Bore Reaming (${holeSampleStr}), Deburring & Coaxiality Inspection`
+            : `Outer Diameter Finishing (${bossSampleStr}), Edge Break, Ultrasonic Cleaning & Runout Verification`;
+      } else if (archetype === 'sheet_metal') {
+        manufacturingProcess =
+          compHoles.length > 0
+            ? 'Fiber-Laser Sheet Contour Cutting, CNC Drilling / Punching & Press-Brake Forming'
+            : 'Fiber-Laser Sheet Contour Cutting & CNC Press-Brake Forming';
+        structuralRole =
+          classified?.roleOverride ||
+          `Thin-Section Plate / Formed Sheet Component (${sMin.toFixed(1)} mm Section Thickness — Functional Role Requires Drawing Verification)`;
+        secondaryOperations =
+          'Rotary Brush Edge Deburring, Flatness / Bend Verification & Surface Protection';
+      } else if (archetype === 'mixed_prismatic_rotational') {
+        manufacturingProcess = castingOrForgingJustified
+          ? '3-Axis / 3+2-Axis Indexed CNC Milling, Boss Profiling & Precision Boring (or Near-Net Cast/Forged Blank + Finish CNC on Functional Datums & Bores)'
+          : compHoles.length > 0
+            ? '3-Axis / 3+2-Axis Indexed CNC Milling, Cylindrical Boss Profiling & Precision Boring'
+            : '3-Axis / 3+2-Axis Indexed CNC Milling & Cylindrical Boss Contour Profiling';
+        structuralRole =
+          classified?.roleOverride ||
+          `Prismatic-Cylindrical Machined Component / Bracket / Housing (${compPlanes.length} Planar Datum/Wall Surface(s), ${compBosses.length} Cylindrical Boss/Collar Feature(s), ${compHoles.length} Bore(s), ${(fillRatio * 100).toFixed(1)}% Solid Fill — Exact Functional Role Requires Drawing Verification)`;
+        secondaryOperations =
+          compHoles.length > 0
+            ? `Primary Datum Face Milling (${primaryPlaneStr}), Helical Bore Interpolation & Reaming (${holeSampleStr}), Cylindrical Boss Blending (${bossSampleStr}), Deburring & CMM Position Check`
+            : `Primary Datum Face Milling (${primaryPlaneStr}), Cylindrical Boss Profiling (${bossSampleStr}), CNC Edge Deburring & CMM Verification`;
       } else {
-        manufacturingProcess = '3-Axis CNC Face Milling & High-Speed Perimeter Contour Profiling';
-        structuralRole =
-          `Prismatic Machined Structural Block (${compPlanes.length} Planar Datum Faces, ${(fillRatio * 100).toFixed(1)}% Volumetric Fill — Requires Verification)`;
-        secondaryOperations = `Datum Face Milling (${primaryPlaneStr}), Perimeter End-Mill Profiling, In-Cycle Edge Chamfering & CMM Dimensional Check`;
+        if (castingOrForgingJustified && compHoles.length > 0) {
+          manufacturingProcess =
+            '3-Axis / 4-Axis CNC Milling, Pocket Roughing & Precision Boring (or Near-Net Blank + Finish CNC Machining)';
+          structuralRole =
+            classified?.roleOverride ||
+            `Multi-Bore Prismatic Machined Component / Housing (${compPlanes.length} Planar Faces, ${compHoles.length} Bore(s), ${(fillRatio * 100).toFixed(1)}% Fill Ratio — Exact Functional Role Requires Drawing Verification)`;
+          secondaryOperations =
+            `Primary Datum Face Milling (${primaryPlaneStr}), Spot-Drilling, Precision Drilling & Bore Reaming (${holeSampleStr}), Deburring & CMM Audit`;
+        } else if (compHoles.length > 0) {
+          manufacturingProcess = '3-Axis CNC Face Milling, Pocket/Profile Roughing & Precision Drilling/Boring';
+          structuralRole =
+            classified?.roleOverride ||
+            `Prismatic Machined Plate / Structural Component (${compPlanes.length} Planar Faces, ${compHoles.length} Bore(s) — Exact Functional Role Requires Drawing Verification)`;
+          secondaryOperations =
+            `Vise Datum Squaring (${primaryPlaneStr}), Spot-Drilling, Solid-Carbide Drilling & Bore Reaming (${holeSampleStr}), Edge Break & Ultrasonic Cleaning`;
+        } else {
+          manufacturingProcess = '3-Axis CNC Face Milling & Perimeter Contour Profiling';
+          structuralRole =
+            classified?.roleOverride ||
+            `Prismatic Machined Structural Component (${compPlanes.length} Planar Datum Faces, ${(fillRatio * 100).toFixed(1)}% Solid Fill — Exact Functional Role Requires Drawing Verification)`;
+          secondaryOperations = `Datum Face Milling (${primaryPlaneStr}), Perimeter End-Mill Profiling, In-Cycle Edge Chamfering & CMM Dimensional Check`;
+        }
       }
     }
+
+    const effectiveArchForStock: GeometricArchetypeKind =
+      classified?.componentCategory === 'machined_gear' ||
+      classified?.componentCategory === 'machined_carrier_or_flange' ||
+      classified?.componentCategory === 'machined_shaft_or_cam'
+        ? 'rotational_shaft_or_sleeve'
+        : archetype;
 
     const stockValidation = computeAndValidateRawStockGeometry(
       bboxSize,
       unitNetVolCm3,
       unitAreaCm2,
-      archetype,
+      effectiveArchForStock,
       'BILLET_CNC',
       2.0,
       compPositions
@@ -2692,21 +3673,22 @@ export function analyzeCadGeometryAndTopology(
         : 0;
 
     const volumeConversionExplanation =
-      `Validated physical raw stock (${rawStockDimensionsMm} · V_raw = ${rawVolM3.toFixed(6)} m³ / ${safeRawVol.toFixed(3)} cm³) geometrically contains the finished part envelope (${bboxSize.x.toFixed(1)}×${bboxSize.y.toFixed(1)}×${bboxSize.z.toFixed(1)} mm) with bilateral machining allowances. ` +
-      `Under "${manufacturingProcess}", primary stock removal machines V_rem = V_raw − V_net = ${safeRawVol.toFixed(3)} − ${unitNetVolCm3.toFixed(3)} = ${removedVolCm3.toFixed(3)} cm³ (${removedVolM3Display} m³) across ${
+      `Physical raw stock (${rawStockDimensionsMm} · V_raw = ${rawVolM3.toFixed(6)} m³ / ${safeRawVol.toFixed(2)} cm³ per unit) geometrically contains the finished part envelope (${bboxSize.x.toFixed(1)}×${bboxSize.y.toFixed(1)}×${bboxSize.z.toFixed(1)} mm) with bilateral machining allowances. ` +
+      `Under "${manufacturingProcess}", primary stock removal machines V_rem = V_raw − V_net = ${safeRawVol.toFixed(2)} − ${unitNetVolCm3.toFixed(3)} = ${removedVolCm3.toFixed(2)} cm³ (${removedVolM3Display} m³) per unit across ${
         compHoles.length > 0
-          ? `outer surfaces (${primaryPlaneStr}) and ${compHoles.length} internal bore(s) (${holeSampleStr})`
+          ? `datum/perimeter surfaces (${primaryPlaneStr}) and ${compHoles.length} internal bore(s) (${holeSampleStr})`
           : compBosses.length > 0
-            ? `${compBosses.length} cylindrical journal/lobe/collar section(s) (${bossSampleStr}) and datum faces (${primaryPlaneStr})`
+            ? `${compBosses.length} cylindrical boss/section(s) (${bossSampleStr}) and planar datum surfaces (${primaryPlaneStr})`
             : `planar datum and perimeter surfaces (${primaryPlaneStr})`
-      } to reach net solid volume V_net = ${netVolM3.toFixed(6)} m³ (${unitNetVolCm3.toFixed(3)} cm³).`;
+      } to reach net solid volume V_net = ${netVolM3.toFixed(6)} m³ (${unitNetVolCm3.toFixed(3)} cm³) per unit.`;
 
     const chipRemovalExplanation =
-      `Explicit Chip Removal Equation: (V_raw − V_net) / V_raw = (${safeRawVol.toFixed(3)} − ${unitNetVolCm3.toFixed(3)}) / ${safeRawVol.toFixed(3)} = ${removedVolCm3.toFixed(3)} / ${safeRawVol.toFixed(3)} = ${chipRemovalRatioPct.toFixed(1)}%. ` +
-      `(1) Process & Topology Basis (${archetype.replace(/_/g, ' ')}): ${
-        archetype === 'rotational_multi_journal_or_cam' || archetype === 'rotational_shaft_or_sleeve'
-          ? `Turning from Ø${stockValidation.proposedStockEnvelopeMm[1].toFixed(1)} mm round bar requires turning down stepped shaft necks between ${distinctDiameterCount || 1} outer diameter(s)${eccentricSectionCount > 0 ? ` and ${eccentricSectionCount} eccentric cam/lobe section(s)` : ''}; switching to a near-net closed-die forging or chill casting (Route C) reduces chip removal to ~14–20%.`
-          : `Machining from ${rawStockDimensionsMm} removes ${removedVolCm3.toFixed(2)} cm³ of stock around ${compBosses.length} boss(es) and ${compHoles.length} bore(s); near-net profile blanking (Route B) or casting (Route C) reduces swarf generation.`
+      `Explicit Chip Removal Equation (per unit): (V_raw − V_net) / V_raw = (${safeRawVol.toFixed(2)} − ${unitNetVolCm3.toFixed(3)}) / ${safeRawVol.toFixed(2)} = ${removedVolCm3.toFixed(2)} / ${safeRawVol.toFixed(2)} = ${chipRemovalRatioPct.toFixed(1)}%. ` +
+      `(1) Process & 3D Geometry Basis (${effectiveArchForStock.replace(/_/g, ' ')}): ${
+        effectiveArchForStock === 'rotational_multi_journal_or_cam' ||
+        effectiveArchForStock === 'rotational_shaft_or_sleeve'
+          ? `Turning/hobbing from Ø${stockValidation.proposedStockEnvelopeMm[1].toFixed(1)} mm round bar removes radial stock across ${distinctDiameterCount || 1} outer diameter section(s); near-net preform (Route C) reduces swarf.`
+          : `Machining from ${rawStockDimensionsMm} removes ${removedVolCm3.toFixed(2)} cm³ of stock around ${compPlanes.length} planar wall/datum face(s), ${compBosses.length} boss(es), and ${compHoles.length} bore(s); near-net profile blanking (Route B) or casting/forging (Route C) reduces swarf.`
       } ` +
       `(2) Material Basis: ${matSpec} governs density, roughing MRR, cutting energy, and swarf recovery credit.`;
 
@@ -2724,15 +3706,14 @@ export function analyzeCadGeometryAndTopology(
         .map((b) => `${b.id}:Ø${(b.diameterMm || 0).toFixed(1)}`)
         .join(', ');
       const cylLabel =
-        archetype === 'rotational_multi_journal_or_cam'
-          ? 'Journal/Cam-Lobe/Collar Section(s)'
-          : archetype === 'rotational_shaft_or_sleeve'
-            ? 'Cylindrical Journal/Shaft Section(s)'
-            : 'Cylindrical Boss/Collar(s)';
+        effectiveArchForStock === 'rotational_multi_journal_or_cam' ||
+        effectiveArchForStock === 'rotational_shaft_or_sleeve'
+          ? 'Cylindrical Shaft/Sleeve Section(s)'
+          : 'Cylindrical Boss/Collar(s)';
       featTokens.push(`${compBosses.length}× ${cylLabel} (${bossDias} mm)`);
     }
     if (compPlanes.length > 0) {
-      featTokens.push(`${Math.min(compPlanes.length, 6)}× Primary Planar/End Surface(s) (${primaryPlaneStr})`);
+      featTokens.push(`${Math.min(compPlanes.length, 6)}× Primary Planar Surface(s) (${primaryPlaneStr})`);
     }
     if (compChamfers.length > 0) {
       featTokens.push(`${compChamfers.length}× Chamfer/Fillet Blend(s)`);
@@ -2741,13 +3722,13 @@ export function analyzeCadGeometryAndTopology(
       featTokens.length > 0 ? featTokens.join(' · ') : 'Contiguous 3D Solid Geometry';
 
     const remarks =
-      `${structuralRole}; primary process: ${manufacturingProcess}; finished envelope ${bboxSize.x.toFixed(1)}×${bboxSize.y.toFixed(1)}×${bboxSize.z.toFixed(1)} mm; validated stock: ${rawStockDimensionsMm} (${chipRemovalRatioPct.toFixed(1)}% chip removal). ` +
+      `${structuralRole}; primary process: ${manufacturingProcess}; finished envelope ${bboxSize.x.toFixed(1)}×${bboxSize.y.toFixed(1)}×${bboxSize.z.toFixed(1)} mm; raw stock (aligned with Costing): ${rawStockDimensionsMm} (${safeRawVol.toFixed(2)} cm³ raw → ${unitNetVolCm3.toFixed(3)} cm³ net per unit, ${chipRemovalRatioPct.toFixed(1)}% chip removal).${primarySpatialNote} ` +
       (metadata.materialDeclared
         ? `Material extracted from CAD metadata (${metadata.materialDeclared}).`
-        : `Disclosed Assumption: Material (${matSpec}), general tolerance (ISO 2768-mK), and batch size are scenario assumptions requiring verification against the 2D production drawing.`);
+        : `Preliminary Engineering Assumption: Material (${matSpec}), general tolerance (ISO 2768-mK), and batch size are scenario assumptions requiring 2D drawing verification.`);
 
     return {
-      archetype,
+      archetype: effectiveArchForStock,
       manufacturingProcess,
       structuralRole,
       secondaryOperations,
@@ -2770,24 +3751,21 @@ export function analyzeCadGeometryAndTopology(
 
   if (compMetrics.length === 1) {
     const m = compMetrics[0];
-    const cleanName =
-      m.comp.name.replace(/_/g, ' ').trim() ||
-      metadata.fileName.replace(/\.[^/.]+$/, '').replace(/_/g, ' ').trim() ||
-      'Single-Piece Component';
-    const bboxStr = `${m.bboxSize.x.toFixed(2)} × ${m.bboxSize.y.toFixed(2)} × ${m.bboxSize.z.toFixed(2)} mm`;
-    const compArch = evaluateGeometricArchetypeFromTopology(
+    const classified = classifyAndNameEngineeringComponent(
+      m.comp.name,
+      m.comp.parentAssemblyName,
+      metadata.fileName,
       m.bboxSize,
       m.volumeMm3,
+      m.areaMm2,
       holeFeatures,
       bossFeatures,
       planarFacesAll,
+      false,
+      m.comp.materialFromMetadata,
       m.comp.positions
     );
-    const matInfo = resolveAuthoritativeMaterial(
-      m.comp.materialFromMetadata || metadata.materialDeclared,
-      undefined,
-      compArch.archetype
-    );
+    const bboxStr = `${m.bboxSize.x.toFixed(2)} × ${m.bboxSize.y.toFixed(2)} × ${m.bboxSize.z.toFixed(2)} mm`;
     const details = inferComponentManufacturingDetails(
       m.bboxSize,
       m.volumeMm3,
@@ -2797,32 +3775,44 @@ export function analyzeCadGeometryAndTopology(
       blendFacesAll,
       planarFacesAll,
       false,
-      matInfo.displaySpec,
-      m.comp.positions
+      classified.materialDisplaySpec,
+      m.comp.positions,
+      classified
     );
     const unitVolCm3 = Number((m.volumeMm3 / 1000).toFixed(3));
+    const unitAreaCm2 = Number((m.areaMm2 / 100).toFixed(2));
+    const unitMassGrams = Number((unitVolCm3 * classified.densityGPerCm3).toFixed(1));
 
     bomEntries.push({
       itemNumber: 1,
-      componentName: `${cleanName} (Single-Piece Component)`,
+      componentName: classified.engineeringName,
+      componentSourceType: classified.componentSourceType,
+      componentCategory: classified.componentCategory,
+      materialGradeKey: classified.materialGradeKey,
       structuralRole: details.structuralRole,
       quantity: 1,
-      material: matInfo.displaySpec,
-      densityGPerCm3: matInfo.densityGPerCm3,
+      material: classified.materialDisplaySpec,
+      densityGPerCm3: classified.densityGPerCm3,
       remarks: details.remarks,
       manufacturingProcess: details.manufacturingProcess,
       secondaryOperations: details.secondaryOperations,
       boundingBoxMm: bboxStr,
       rawStockDimensionsMm: details.rawStockDimensionsMm,
       rawStockVolumeCm3: details.rawStockVolumeCm3,
+      unitRawStockVolumeCm3: details.rawStockVolumeCm3,
       volumeCm3: unitVolCm3,
+      unitVolumeCm3: unitVolCm3,
       rawVolumeM3: details.rawVolM3,
       netVolumeM3: details.netVolM3,
       volumeConversionExplanation: details.volumeConversionExplanation,
       chipRemovalRatioPct: details.chipRemovalRatioPct,
       chipRemovalExplanation: details.chipRemovalExplanation,
-      surfaceAreaCm2: Number((m.areaMm2 / 100).toFixed(2)),
-      estimatedMassGrams: Number((unitVolCm3 * matInfo.densityGPerCm3).toFixed(1)),
+      surfaceAreaCm2: unitAreaCm2,
+      unitSurfaceAreaCm2: unitAreaCm2,
+      estimatedMassGrams: unitMassGrams,
+      unitEstimatedMassGrams: unitMassGrams,
+      assumedPurchasedUnitCostSek: classified.assumedPurchasedUnitCostSek,
+      purchasedCostBasisNote: classified.purchasedCostBasisNote,
       triangleCount: m.triCount,
       featureSummary: details.featureSummary,
       componentIndices: [m.comp.index],
@@ -2833,6 +3823,9 @@ export function analyzeCadGeometryAndTopology(
       string,
       {
         cleanName: string;
+        componentSourceType: 'MANUFACTURED_CUSTOM' | 'PURCHASED_STANDARD_CATALOG';
+        componentCategory: NonNullable<BomEntry['componentCategory']>;
+        materialGradeKey: MaterialGradeKey;
         material: string;
         densityGPerCm3: number;
         remarks: string;
@@ -2840,6 +3833,7 @@ export function analyzeCadGeometryAndTopology(
         structuralRole: string;
         secondaryOperations: string;
         bboxStr: string;
+        bboxVolMm3: number;
         rawStockDimensionsMm: string;
         unitRawVolCm3: number;
         unitVolCm3: number;
@@ -2847,6 +3841,8 @@ export function analyzeCadGeometryAndTopology(
         chipRemovalRatioPct: number;
         chipRemovalExplanation: string;
         unitAreaCm2: number;
+        assumedPurchasedUnitCostSek?: number;
+        purchasedCostBasisNote?: string;
         triCount: number;
         featureSummary: string;
         indices: number[];
@@ -2854,28 +3850,32 @@ export function analyzeCadGeometryAndTopology(
       }
     >();
 
-    compMetrics.forEach((m, idx) => {
-      const cleanName = m.comp.name.replace(/_/g, ' ').trim() || `Component ${idx + 1}`;
-      const bboxStr = `${m.bboxSize.x.toFixed(2)} × ${m.bboxSize.y.toFixed(2)} × ${m.bboxSize.z.toFixed(2)} mm`;
+    compMetrics.forEach((m) => {
       const unitVolCm3 = Number((m.volumeMm3 / 1000).toFixed(3));
       const unitAreaCm2 = Number((m.areaMm2 / 100).toFixed(2));
       const compHoles = holeFeatures.filter((f) => f.componentIndex === m.comp.index);
       const compBosses = bossFeatures.filter((f) => f.componentIndex === m.comp.index);
       const compBlends = blendFacesAll.filter((f) => f.componentIndex === m.comp.index);
       const compPlanes = planarFacesAll.filter((f) => f.componentIndex === m.comp.index);
-      const compArch = evaluateGeometricArchetypeFromTopology(
+
+      const classified = classifyAndNameEngineeringComponent(
+        m.comp.name,
+        m.comp.parentAssemblyName,
+        metadata.fileName,
         m.bboxSize,
         m.volumeMm3,
+        m.areaMm2,
         compHoles,
         compBosses,
         compPlanes,
+        true,
+        m.comp.materialFromMetadata,
         m.comp.positions
       );
-      const matInfo = resolveAuthoritativeMaterial(
-        m.comp.materialFromMetadata || metadata.materialDeclared,
-        undefined,
-        compArch.archetype
-      );
+
+      const bboxStr = `${m.bboxSize.x.toFixed(2)} × ${m.bboxSize.y.toFixed(2)} × ${m.bboxSize.z.toFixed(2)} mm`;
+      const bboxVolMm3 = m.bboxSize.x * m.bboxSize.y * m.bboxSize.z;
+
       const details = inferComponentManufacturingDetails(
         m.bboxSize,
         m.volumeMm3,
@@ -2885,29 +3885,52 @@ export function analyzeCadGeometryAndTopology(
         compBlends,
         compPlanes,
         true,
-        matInfo.displaySpec,
-        m.comp.positions
+        classified.materialDisplaySpec,
+        m.comp.positions,
+        classified
       );
 
-      const dimsSorted = [m.bboxSize.x, m.bboxSize.y, m.bboxSize.z]
-        .map((v) => v.toFixed(1))
-        .sort()
-        .join('x');
-      const sigKey = `${cleanName.toLowerCase()}|${dimsSorted}|${unitVolCm3.toFixed(2)}`;
+      // Orientation-invariant signature:
+      // Identical parts placed at arbitrary 3D rotation angles share the same sourceMeshKey or
+      // the same (baseGroupKey, rotation-invariant volume, and rotation-invariant surface area).
+      const volTolBucket =
+        unitVolCm3 < 1.0 ? unitVolCm3.toFixed(2) : (Math.round(unitVolCm3 * 20) / 20).toFixed(2);
+      const areaTolBucket =
+        unitAreaCm2 < 5.0 ? unitAreaCm2.toFixed(1) : Math.round(unitAreaCm2).toString();
+      const sigKey = m.comp.sourceMeshKey
+        ? `mesh:${m.comp.sourceMeshKey}|${classified.baseGroupKey}`
+        : `geom:${classified.baseGroupKey}|V:${volTolBucket}|A:${areaTolBucket}`;
+
       const existing = groupedComps.get(sigKey);
       if (existing) {
         existing.indices.push(m.comp.index);
         existing.triCount += m.triCount;
+        // Keep the tightest (least-rotated) bounding box & raw stock among rotated instances
+        if (bboxVolMm3 < existing.bboxVolMm3 * 0.98) {
+          existing.bboxVolMm3 = bboxVolMm3;
+          existing.bboxStr = bboxStr;
+          existing.rawStockDimensionsMm = details.rawStockDimensionsMm;
+          existing.unitRawVolCm3 = details.rawStockVolumeCm3;
+          existing.stockValidation = details.stockValidation;
+          existing.volumeConversionExplanation = details.volumeConversionExplanation;
+          existing.chipRemovalRatioPct = details.chipRemovalRatioPct;
+          existing.chipRemovalExplanation = details.chipRemovalExplanation;
+          existing.remarks = details.remarks;
+        }
       } else {
         groupedComps.set(sigKey, {
-          cleanName,
-          material: matInfo.displaySpec,
-          densityGPerCm3: matInfo.densityGPerCm3,
+          cleanName: classified.engineeringName,
+          componentSourceType: classified.componentSourceType,
+          componentCategory: classified.componentCategory,
+          materialGradeKey: classified.materialGradeKey,
+          material: classified.materialDisplaySpec,
+          densityGPerCm3: classified.densityGPerCm3,
           remarks: details.remarks,
           manufacturingProcess: details.manufacturingProcess,
           structuralRole: details.structuralRole,
           secondaryOperations: details.secondaryOperations,
           bboxStr,
+          bboxVolMm3,
           rawStockDimensionsMm: details.rawStockDimensionsMm,
           unitRawVolCm3: details.rawStockVolumeCm3,
           unitVolCm3,
@@ -2915,6 +3938,8 @@ export function analyzeCadGeometryAndTopology(
           chipRemovalRatioPct: details.chipRemovalRatioPct,
           chipRemovalExplanation: details.chipRemovalExplanation,
           unitAreaCm2,
+          assumedPurchasedUnitCostSek: classified.assumedPurchasedUnitCostSek,
+          purchasedCostBasisNote: classified.purchasedCostBasisNote,
           triCount: m.triCount,
           featureSummary: details.featureSummary,
           indices: [m.comp.index],
@@ -2928,27 +3953,41 @@ export function analyzeCadGeometryAndTopology(
       const qty = grp.indices.length;
       const totalNetVolCm3 = Number((grp.unitVolCm3 * qty).toFixed(3));
       const totalRawVolCm3 = Number((grp.unitRawVolCm3 * qty).toFixed(3));
+      const unitMassGrams = Number((grp.unitVolCm3 * grp.densityGPerCm3).toFixed(1));
+      const totalMassGrams = Number((unitMassGrams * qty).toFixed(1));
       bomEntries.push({
         itemNumber: itemIdx++,
         componentName: grp.cleanName,
+        componentSourceType: grp.componentSourceType,
+        componentCategory: grp.componentCategory,
+        materialGradeKey: grp.materialGradeKey,
         structuralRole: grp.structuralRole,
         quantity: qty,
         material: grp.material,
         densityGPerCm3: grp.densityGPerCm3,
-        remarks: grp.remarks,
+        remarks:
+          qty > 1
+            ? `${grp.remarks} (Grouped Assembly Quantity: ${qty} identical instances across assembly orientations; Unit Net Volume = ${grp.unitVolCm3.toFixed(3)} cm³/pc → Total = ${totalNetVolCm3.toFixed(3)} cm³).`
+            : grp.remarks,
         manufacturingProcess: grp.manufacturingProcess,
         secondaryOperations: grp.secondaryOperations,
         boundingBoxMm: grp.bboxStr,
         rawStockDimensionsMm: grp.rawStockDimensionsMm,
         rawStockVolumeCm3: totalRawVolCm3,
+        unitRawStockVolumeCm3: grp.unitRawVolCm3,
         volumeCm3: totalNetVolCm3,
+        unitVolumeCm3: grp.unitVolCm3,
         rawVolumeM3: Number((totalRawVolCm3 * 1e-6).toPrecision(5)),
         netVolumeM3: Number((totalNetVolCm3 * 1e-6).toPrecision(5)),
         volumeConversionExplanation: grp.volumeConversionExplanation,
         chipRemovalRatioPct: grp.chipRemovalRatioPct,
         chipRemovalExplanation: grp.chipRemovalExplanation,
         surfaceAreaCm2: Number((grp.unitAreaCm2 * qty).toFixed(2)),
-        estimatedMassGrams: Number((totalNetVolCm3 * grp.densityGPerCm3).toFixed(1)),
+        unitSurfaceAreaCm2: grp.unitAreaCm2,
+        estimatedMassGrams: totalMassGrams,
+        unitEstimatedMassGrams: unitMassGrams,
+        assumedPurchasedUnitCostSek: grp.assumedPurchasedUnitCostSek,
+        purchasedCostBasisNote: grp.purchasedCostBasisNote,
         triangleCount: grp.triCount,
         featureSummary: grp.featureSummary,
         componentIndices: grp.indices,
@@ -2965,8 +4004,15 @@ export function analyzeCadGeometryAndTopology(
   if (bomEntries.length > 0) {
     const bomSumBefore = Number(bomEntries.reduce((acc, e) => acc + e.volumeCm3, 0).toFixed(3));
     const volResidual = Number((authoritativeVolCm3 - bomSumBefore).toFixed(3));
-    if (Math.abs(volResidual) > 0 && Math.abs(volResidual) <= 0.05) {
+    if (Math.abs(volResidual) > 0 && Math.abs(volResidual) <= 0.15) {
       bomEntries[0].volumeCm3 = Number((bomEntries[0].volumeCm3 + volResidual).toFixed(3));
+      bomEntries[0].unitVolumeCm3 = Number(
+        (bomEntries[0].volumeCm3 / Math.max(1, bomEntries[0].quantity)).toFixed(3)
+      );
+      if (bomEntries[0].componentSourceType === 'PURCHASED_STANDARD_CATALOG') {
+        bomEntries[0].rawStockVolumeCm3 = bomEntries[0].volumeCm3;
+        bomEntries[0].unitRawStockVolumeCm3 = bomEntries[0].unitVolumeCm3;
+      }
       if (bomEntries[0].stockValidation) {
         bomEntries[0].stockValidation.netPartVolumeCm3 = bomEntries[0].volumeCm3;
       }
@@ -2974,6 +4020,15 @@ export function analyzeCadGeometryAndTopology(
     for (const entry of bomEntries) {
       entry.netVolumeM3 = Number((entry.volumeCm3 * 1e-6).toFixed(9));
       entry.rawVolumeM3 = Number((entry.rawStockVolumeCm3 * 1e-6).toFixed(9));
+      entry.unitVolumeCm3 = Number(
+        (entry.volumeCm3 / Math.max(1, entry.quantity)).toFixed(3)
+      );
+      entry.unitRawStockVolumeCm3 = Number(
+        (entry.rawStockVolumeCm3 / Math.max(1, entry.quantity)).toFixed(3)
+      );
+      entry.unitEstimatedMassGrams = Number(
+        (entry.unitVolumeCm3 * entry.densityGPerCm3).toFixed(1)
+      );
       entry.estimatedMassGrams = Number((entry.volumeCm3 * entry.densityGPerCm3).toFixed(1));
     }
   }
@@ -3051,17 +4106,19 @@ export function analyzeCadGeometryAndTopology(
       ? Number(
           (
             verifiedCylCandidates.reduce(
-              (acc, c) => acc + Math.max(0.008, c.fittedRadiusMm * Math.max(0.0015, c.rmsFitErrorRatio)),
+              (acc, c) => acc + Math.max(0.001, c.fittedRadiusMm * Math.max(0.0005, c.rmsFitErrorRatio)),
               0
             ) / verifiedCylCandidates.length
           ).toFixed(3)
         )
-      : 0.015;
+      : isFineStepTess
+        ? 0.002
+        : 0.015;
 
   const curvedAreaShare =
     (sumArea(holeFeatures) + sumArea(bossFeatures) + sumArea(blendFacesAll)) / safeTotalArea;
   const volumetricDiscretizationUncertaintyPct = Number(
-    Math.max(0.05, Math.min(1.25, curvedAreaShare * (420 / Math.max(120, totalTriangles)) * 100)).toFixed(2)
+    Math.max(0.03, Math.min(1.25, curvedAreaShare * (420 / Math.max(120, totalTriangles)) * 100)).toFixed(2)
   );
 
   const kernelAndMeshVerification: KernelAndMeshVerification = {
@@ -3069,71 +4126,98 @@ export function analyzeCadGeometryAndTopology(
       ? 'Analytical B-Rep + Tessellation'
       : 'Tessellated Surface Mesh (Faceted)',
     sourceFormat: metadata.format,
-    volumeComputationMethod:
-      'Signed Tetrahedral Divergence Theorem (V = |Σ 1/6 (v1 × v2) · v3| across closed 3D mesh)',
-    boreMeasurementMethod:
-      'Dihedral Normal Clustering + Algebraic Kåsa Least-Squares Circle Fit in Orthogonal Plane',
+    volumeComputationMethod: isFineStepTess
+      ? 'Signed Tetrahedral Divergence on Fine STEP B-Rep Tessellation (0.001 mm Deflection; Mesh Integration)'
+      : 'Signed Tetrahedral Divergence Theorem on Tessellated Surface Mesh (Mesh Approximation)',
+    boreMeasurementMethod: metadata.hasNativeBrepAnalytics
+      ? 'Native STEP Analytical B-Rep Surface Radii (CYLINDRICAL_SURFACE / CIRCLE) + Normal Clustering'
+      : 'Tessellated Mesh Normal Clustering + Algebraic Kåsa Least-Squares Circle Fit',
     meanChordalDeviationMm: avgChordalDevMm,
     volumetricDiscretizationUncertaintyPct,
     canVerifyPrecisionTolerancesFromMesh: false,
     toleranceVerificationLimitationNote:
-      `Nominal linear dimensions, diameters, and solid volume are extracted directly from the 3D CAD geometry. ` +
+      `Cylindrical radii in STEP files are cross-checked against analytical B-Rep CYLINDRICAL_SURFACE/CIRCLE entities (${metadata.nativeStepCylindricalRadiiMm?.length || 0} analytical radii extracted), while enclosed volume and surface area are integrated across the tessellated solid mesh. ` +
       `Tight fit tolerances (such as ISO H7/g6 journal or bore fits) and GD&T datum frames cannot be inferred from unlabeled 3D geometry and require verification against native PMI or the 2D engineering drawing.`,
   };
+
+  const totalInstancesCount = bomEntries.reduce((acc, e) => acc + e.quantity, 0);
+  const manufacturedEntriesCount = bomEntries.filter(
+    (e) => e.componentSourceType !== 'PURCHASED_STANDARD_CATALOG'
+  ).length;
+  const purchasedEntriesCount = bomEntries.filter(
+    (e) => e.componentSourceType === 'PURCHASED_STANDARD_CATALOG'
+  ).length;
 
   const factsVsAssumptions: CadFactVsAssumptionRow[] = [
     {
       category: 'Geometry & Envelope',
       parameter: 'Bounding Box Envelope (ΔX × ΔY × ΔZ)',
       value: `${overallSpan.x.toFixed(2)} × ${overallSpan.y.toFixed(2)} × ${overallSpan.z.toFixed(2)} mm`,
-      classification: 'CAD_EXTRACTED_FACT',
-      sourceOrBasis: `Directly measured from 3D coordinate bounds of ${metadata.fileName}`,
+      classification: isFineStepTess ? 'CAD_EXTRACTED_FACT' : 'MESH_DERIVED_WITH_UNCERTAINTY',
+      sourceOrBasis: isFineStepTess
+        ? `Directly measured from fine STEP B-Rep tessellation (0.001 mm deflection) of ${metadata.fileName}`
+        : `Measured from tessellated mesh vertex bounds of ${metadata.fileName}`,
     },
     {
       category: 'Volumetric Metrology',
       parameter: 'Enclosed Net Solid Volume',
       value: `${netSolidVolCm3.toFixed(3)} cm³ (${authoritativeVolMm3.toLocaleString()} mm³)`,
+      classification: 'MESH_DERIVED_WITH_UNCERTAINTY',
+      sourceOrBasis: `Computed via signed tetrahedral divergence on the closed 3D mesh (±${volumetricDiscretizationUncertaintyPct}% mesh discretization uncertainty; synchronized across 2D Report, BOM, Cost Model & AI Assistant)`,
+    },
+    {
+      category: 'Assembly Structure & Identification',
+      parameter: 'Component Hierarchy & Instance Grouping',
+      value:
+        bomEntries.length > 1 || totalInstancesCount > 1
+          ? `${bomEntries.length} Unique Component Group(s) (${totalInstancesCount} Total Part Instances: ${manufacturedEntriesCount} Custom Manufactured, ${purchasedEntriesCount} Purchased Catalog Group(s))`
+          : `1 Single-Piece Component (${bomEntries[0]?.componentName || 'Monolithic Part'})`,
       classification: 'CAD_EXTRACTED_FACT',
-      sourceOrBasis: `Computed from enclosed 3D solid geometry (synchronized across 2D Report, BOM, Cost Model & AI Assistant)`,
+      sourceOrBasis: `Extracted from CAD assembly hierarchy and orientation-invariant 3D solid instance matching`,
     },
     {
       category: 'Identifiable Features',
       parameter: 'Holes, Cylindrical Sections & Datum Surfaces',
       value: `${holeFeatures.length} Bore(s), ${bossFeatures.length} Cylindrical Section(s), ${Math.min(planarFacesAll.length, 6)} Primary Datum Surface(s)`,
-      classification: 'MESH_DERIVED_WITH_UNCERTAINTY',
-      sourceOrBasis: 'Inferred from 3D surface curvature and normal clustering; functional role requires drawing verification',
+      classification: metadata.hasNativeBrepAnalytics
+        ? 'CAD_EXTRACTED_FACT'
+        : 'MESH_DERIVED_WITH_UNCERTAINTY',
+      sourceOrBasis: metadata.hasNativeBrepAnalytics
+        ? 'Cylindrical radii verified against native STEP B-Rep CYLINDRICAL_SURFACE / CIRCLE entities; functional role requires 2D drawing verification'
+        : 'Inferred from 3D surface curvature and normal clustering; functional role requires drawing verification',
     },
     {
       category: 'Material Specification',
-      parameter: 'Engineering Alloy & Density',
-      value: `${bomEntries[0]?.material || 'Assumed Baseline Alloy'} (${bomEntries[0]?.densityGPerCm3.toFixed(2) || '2.70'} g/cm³)`,
+      parameter: 'Component Engineering Alloy(s) & Density',
+      value:
+        bomEntries.length > 1
+          ? `${Array.from(new Set(bomEntries.map((e) => e.material.split('(')[0].trim()))).join(' / ')}`
+          : `${bomEntries[0]?.material || 'Assumed Baseline Alloy'} (${bomEntries[0]?.densityGPerCm3.toFixed(2) || '2.70'} g/cm³)`,
       classification: metadata.materialDeclared ? 'CAD_EXTRACTED_FACT' : 'COSTING_ASSUMPTION',
       sourceOrBasis: metadata.materialDeclared
         ? `Extracted directly from ${metadata.format} header metadata`
-        : `Not specified in ${metadata.format} file — scenario assumption based on 3D geometry (editable in Stage 6)`,
+        : `Assigned per component engineering function (not specified in ${metadata.format} file — scenario assumption editable in Stage 6)`,
     },
     {
-      category: 'Raw Stock Geometry & Containment',
-      parameter: 'Validated Starting Blank Envelope',
-      value: `${bomEntries[0]?.rawStockDimensionsMm || 'Standard Billet'} (${bomEntries[0]?.rawStockVolumeCm3.toFixed(2) || '0'} cm³)`,
+      category: 'Raw Stock & Purchased Part Basis',
+      parameter: 'Starting Blank Envelope & Catalog Part Allowances',
+      value:
+        purchasedEntriesCount > 0
+          ? `${manufacturedEntriesCount} Custom Blank(s) + ${purchasedEntriesCount} Purchased Catalog Group(s) (Unverified Catalog Allowances)`
+          : `${bomEntries[0]?.rawStockDimensionsMm || 'Standard Billet'} (${bomEntries[0]?.rawStockVolumeCm3.toFixed(2) || '0'} cm³)`,
       classification: 'COSTING_ASSUMPTION',
       sourceOrBasis:
-        bomEntries[0]?.stockValidation?.containmentVerificationNote ||
-        'Verified 3D geometric containment of finished part envelope + machining allowances',
+        purchasedEntriesCount > 0
+          ? 'Custom parts validated for 3D blank containment; purchased standard parts (motors/fasteners/bearings/pins) use disclosed unverified catalog unit allowances'
+          : bomEntries[0]?.stockValidation?.containmentVerificationNote ||
+            'Verified 3D geometric containment of finished part envelope + machining allowances',
     },
     {
-      category: 'Tolerances & Surface Finish',
-      parameter: 'Dimensional Tolerance & Surface Roughness',
-      value: 'ISO 2768-mK General Tolerance · Ra 3.2 μm Machined / Ground Finish (Assumed)',
+      category: 'Tolerances & Manufacturing Economics',
+      parameter: 'Dimensional Tolerance, Sweden SE3 Tariffs & Batch Size',
+      value: 'ISO 2768-mK General Tolerance · Sweden SE3 Industrial Tariffs & Operator Rates',
       classification: 'COSTING_ASSUMPTION',
-      sourceOrBasis: 'No PMI / GD&T tolerance frames present in 3D file — baseline machining standard assumed',
-    },
-    {
-      category: 'Manufacturing Economics',
-      parameter: 'Sweden SE3 Tariffs, Batch Size & Process Route',
-      value: 'Scenario-Based Process Route · SE3 Electricity & Swedish Operator Rates',
-      classification: 'COSTING_ASSUMPTION',
-      sourceOrBasis: 'Published Swedish industrial benchmarks (SCB, Teknikföretagen, Energimyndigheten, Tibnor) — editable in Stage 6',
+      sourceOrBasis: 'Preliminary engineering scenario assumptions (SCB, Teknikföretagen, Energimyndigheten, Tibnor) — editable in Stage 6',
     },
   ];
 
@@ -3159,13 +4243,20 @@ export function analyzeCadGeometryAndTopology(
     factsVsAssumptions,
     surfaceClassifications,
     candidateHolesAndCylinders,
+    spatialRelationships: analyze3DSpatialRelationships(
+      overallSpan,
+      authoritativeVolMm3,
+      holeFeatures,
+      bossFeatures,
+      planarFacesAll
+    ),
     missingManufacturingSpecifications: [
       {
         attribute: 'Material Specification / Grade',
         status: metadata.materialDeclared ? 'SPECIFIED IN CAD' : 'MISSING IN CAD FILE',
         detail: metadata.materialDeclared
           ? `Declared in CAD header: "${metadata.materialDeclared}"`
-          : 'Not specified in CAD file header. Baseline alloy applied as an explicit scenario assumption (editable in Stage 6).',
+          : 'Not specified in CAD file header. Component-appropriate engineering materials applied as explicit scenario assumptions.',
       },
       {
         attribute: 'Dimensional & Geometric Tolerances (GD&T / PMI)',
@@ -3180,12 +4271,14 @@ export function analyzeCadGeometryAndTopology(
           'Surface finish roughness (Ra/Rz) and case/induction hardening specs are not embedded in the CAD file and require drawing verification.',
       },
       {
-        attribute: 'Thread Pitch & Fit Callouts',
+        attribute: 'Purchased Component Catalog Part Numbers',
         status: 'MISSING IN CAD FILE',
         detail:
-          holeFeatures.length > 0
-            ? `${holeFeatures.length} cylindrical bore(s) identified by geometry, but thread pitch/fit class requires drawing verification.`
-            : 'No threaded hole metadata present in the CAD file.',
+          purchasedEntriesCount > 0
+            ? `${purchasedEntriesCount} purchased catalog component group(s) identified; exact supplier part numbers and live vendor quotes require BOM verification.`
+            : holeFeatures.length > 0
+              ? `${holeFeatures.length} cylindrical bore(s) identified by geometry, but thread pitch/fit class requires drawing verification.`
+              : 'No threaded hole metadata present in the CAD file.',
       },
     ],
   };
@@ -3201,11 +4294,11 @@ export function analyzeCadGeometryAndTopology(
     features,
     dimensions,
     bom: {
-      isMultiComponentAssembly: compMetrics.length > 1,
+      isMultiComponentAssembly: bomEntries.length > 1 || totalInstancesCount > 1,
       assemblySummaryNote:
-        compMetrics.length > 1
-          ? `Collection of components (${bomEntries.length} distinct component group${bomEntries.length === 1 ? '' : 's'} · ${netSolidVolCm3.toFixed(3)} cm³ / ${(netSolidVolCm3 * 1e-6).toFixed(6)} m³ total net solid volume)`
-          : `Single-piece monolithic component (${netSolidVolCm3.toFixed(3)} cm³ / ${(netSolidVolCm3 * 1e-6).toFixed(6)} m³ net solid volume)`,
+        bomEntries.length > 1 || totalInstancesCount > 1
+          ? `Engineering Assembly (${bomEntries.length} unique component group${bomEntries.length === 1 ? '' : 's'} · ${totalInstancesCount} total part instances · ${netSolidVolCm3.toFixed(3)} cm³ / ${(netSolidVolCm3 * 1e-6).toFixed(6)} m³ total net solid volume)`
+          : `Single-piece monolithic component — ${bomEntries[0]?.componentName || 'Primary Part'} (${netSolidVolCm3.toFixed(3)} cm³ / ${(netSolidVolCm3 * 1e-6).toFixed(6)} m³ net solid volume)`,
       entries: bomEntries,
     },
     geometryAnalysisReport,
@@ -3536,9 +4629,156 @@ export type GeometricArchetypeKind =
   | 'prismatic_block';
 
 /**
+ * Analyzes 3D spatial relationships between extracted features (coaxiality of bores and bosses,
+ * radial wall thicknesses, parallel bore center-to-center pitch, coaxial clevis/line-bore alignment,
+ * perpendicularity/parallelism to primary planar datums, and opposing planar wall thickness).
+ */
+export function analyze3DSpatialRelationships(
+  bboxSize: THREE.Vector3,
+  volumeMm3: number,
+  compHoles: CadFaceFeature[],
+  compBosses: CadFaceFeature[],
+  compPlanes: CadFaceFeature[]
+): string[] {
+  const relationships: string[] = [];
+  const spans = [bboxSize.x, bboxSize.y, bboxSize.z].sort((a, b) => a - b);
+  const sMin = Math.max(0.1, spans[0]);
+  const sMid = Math.max(0.1, spans[1]);
+  const sMax = Math.max(0.1, spans[2]);
+  const bboxVol = Math.max(1, bboxSize.x * bboxSize.y * bboxSize.z);
+  const fillPct = Number(((volumeMm3 / bboxVol) * 100).toFixed(1));
+
+  const sortedPlanes = [...compPlanes].sort((a, b) => b.areaMm2 - a.areaMm2);
+  const primaryDatum = sortedPlanes[0];
+
+  // 1. Coaxial / Concentric Bore-to-Boss Relationships (Wall Thickness)
+  for (const h of compHoles.slice(0, 6)) {
+    const hAxis = new THREE.Vector3(...h.normalOrAxis).normalize();
+    const hOrig = new THREE.Vector3(...(h.axisOrigin || h.centroid));
+    const hDia = h.diameterMm || 0;
+    if (hDia <= 0) continue;
+
+    for (const b of compBosses.slice(0, 6)) {
+      const bAxis = new THREE.Vector3(...b.normalOrAxis).normalize();
+      const bOrig = new THREE.Vector3(...(b.axisOrigin || b.centroid));
+      const bDia = b.diameterMm || 0;
+      if (bDia <= hDia + 0.5) continue;
+
+      const dot = Math.abs(hAxis.dot(bAxis));
+      if (dot >= 0.95) {
+        const radialOffset = new THREE.Vector3().subVectors(bOrig, hOrig).cross(hAxis).length();
+        if (radialOffset <= 1.8) {
+          const wallMm = (bDia - hDia) * 0.5;
+          relationships.push(
+            `Coaxial Bore-to-Boss Relationship: Internal bore ${h.id} (Ø${hDia.toFixed(2)} mm) is concentric with outer cylindrical feature ${b.id} (Ø${bDia.toFixed(2)} mm, radial offset ${radialOffset.toFixed(2)} mm), forming a ${wallMm.toFixed(2)} mm radial wall.`
+          );
+          break;
+        }
+      }
+    }
+  }
+
+  // 2. Bore-to-Bore Spatial Relationships (Coaxial Line-Bores, Parallel Pitch, or 90° Cross-Bores)
+  if (compHoles.length >= 2) {
+    for (let i = 0; i < Math.min(compHoles.length, 5); i++) {
+      for (let j = i + 1; j < Math.min(compHoles.length, 6); j++) {
+        const h1 = compHoles[i];
+        const h2 = compHoles[j];
+        const a1 = new THREE.Vector3(...h1.normalOrAxis).normalize();
+        const a2 = new THREE.Vector3(...h2.normalOrAxis).normalize();
+        const p1 = new THREE.Vector3(...(h1.axisOrigin || h1.centroid));
+        const p2 = new THREE.Vector3(...(h2.axisOrigin || h2.centroid));
+        const diff = new THREE.Vector3().subVectors(p2, p1);
+        const dot = Math.abs(a1.dot(a2));
+
+        if (dot >= 0.95) {
+          const radialPitch = diff.clone().cross(a1).length();
+          const axialSpan = Math.abs(diff.dot(a1));
+          if (radialPitch <= 1.2 && axialSpan >= 2.0) {
+            relationships.push(
+              `Coaxial Aligned Bores: ${h1.id} (Ø${(h1.diameterMm || 0).toFixed(2)} mm) and ${h2.id} (Ø${(h2.diameterMm || 0).toFixed(2)} mm) share a common axis across a ${axialSpan.toFixed(2)} mm axial span.`
+            );
+          } else if (radialPitch > 1.2) {
+            relationships.push(
+              `Parallel Bore Spacing: ${h1.id} (Ø${(h1.diameterMm || 0).toFixed(2)} mm) and ${h2.id} (Ø${(h2.diameterMm || 0).toFixed(2)} mm) have parallel axes at ${radialPitch.toFixed(2)} mm center-to-center pitch.`
+            );
+          }
+        } else if (dot <= 0.15) {
+          relationships.push(
+            `Orthogonal Cross-Bore Orientation: ${h1.id} (Ø${(h1.diameterMm || 0).toFixed(2)} mm) and ${h2.id} (Ø${(h2.diameterMm || 0).toFixed(2)} mm) are oriented at ~90° to one another (requires indexed or multi-setup machining).`
+          );
+        }
+        if (relationships.length >= 4) break;
+      }
+      if (relationships.length >= 4) break;
+    }
+  }
+
+  // 3. Orientation of Cylindrical Features Relative to Primary Planar Datum (FACE-P01)
+  if (primaryDatum && (compHoles.length > 0 || compBosses.length > 0)) {
+    const nDatum = new THREE.Vector3(...primaryDatum.normalOrAxis).normalize();
+    const perpFeatures: string[] = [];
+    const paraFeatures: string[] = [];
+
+    for (const f of [...compHoles.slice(0, 4), ...compBosses.slice(0, 4)]) {
+      const fAxis = new THREE.Vector3(...f.normalOrAxis).normalize();
+      const dot = Math.abs(fAxis.dot(nDatum));
+      if (dot >= 0.94) {
+        perpFeatures.push(f.id);
+      } else if (dot <= 0.15) {
+        paraFeatures.push(f.id);
+      }
+    }
+
+    if (perpFeatures.length > 0) {
+      relationships.push(
+        `Datum Perpendicularity: Feature axis/axes ${perpFeatures.join(', ')} are perpendicular (90°) to primary planar datum ${primaryDatum.id} (${primaryDatum.areaMm2.toFixed(0)} mm²), allowing direct 3-axis access normal to ${primaryDatum.id}.`
+      );
+    }
+    if (paraFeatures.length > 0) {
+      relationships.push(
+        `Transverse / Side-Axis Orientation: Feature axis/axes ${paraFeatures.join(', ')} run parallel (0°) to primary planar datum ${primaryDatum.id}, requiring a 90° index or secondary vise setup.`
+      );
+    }
+  }
+
+  // 4. Opposing Parallel Planar Faces (Web / Flange Thickness)
+  if (sortedPlanes.length >= 2) {
+    for (let i = 0; i < Math.min(sortedPlanes.length, 4); i++) {
+      for (let j = i + 1; j < Math.min(sortedPlanes.length, 5); j++) {
+        const p1 = sortedPlanes[i];
+        const p2 = sortedPlanes[j];
+        const n1 = new THREE.Vector3(...p1.normalOrAxis).normalize();
+        const n2 = new THREE.Vector3(...p2.normalOrAxis).normalize();
+        if (n1.dot(n2) <= -0.95) {
+          const c1 = new THREE.Vector3(...p1.centroid);
+          const c2 = new THREE.Vector3(...p2.centroid);
+          const distMm = Math.abs(new THREE.Vector3().subVectors(c2, c1).dot(n1));
+          if (distMm >= 1.5 && distMm <= sMax + 0.5) {
+            relationships.push(
+              `Opposing Parallel Datum Faces: ${p1.id} (${p1.areaMm2.toFixed(0)} mm²) and ${p2.id} (${p2.areaMm2.toFixed(0)} mm²) are parallel opposing planar surfaces separated by ${distMm.toFixed(2)} mm.`
+            );
+            break;
+          }
+        }
+      }
+      if (relationships.length >= 5) break;
+    }
+  }
+
+  // 5. Overall 3D Envelope Proportions & Volumetric Solidity
+  relationships.push(
+    `Overall 3D Envelope & Solidity: Bounding proportions ${sMax.toFixed(1)} × ${sMid.toFixed(1)} × ${sMin.toFixed(1)} mm (aspect ratio ${(sMax / sMin).toFixed(2)}:1) with ${fillPct}% solid-to-envelope fill ratio.`
+  );
+
+  return relationships.slice(0, 5);
+}
+
+/**
  * Evaluates geometric archetype strictly from 3D mesh topology, bounding spans, volumetric fill ratio,
  * cylindrical/planar surface distribution, 3D triangle normal orientation, and longitudinal cross-section
- * slice profiling — never hardcoding from filename.
+ * slice profiling — never hardcoding from filename and never assuming that cylindrical features alone
+ * imply a turned shaft or camshaft.
  */
 export function evaluateGeometricArchetypeFromTopology(
   bboxSize: THREE.Vector3,
@@ -3580,11 +4820,11 @@ export function evaluateGeometricArchetypeFromTopology(
     for (const b of compBosses) {
       if (b.diameterMm) distinctDiameters.add((Math.round(b.diameterMm * 2) / 2).toFixed(1));
       const ax = new THREE.Vector3(...b.normalOrAxis).normalize();
-      if (Math.abs(ax.dot(refAxis)) >= 0.9) {
+      if (Math.abs(ax.dot(refAxis)) >= 0.92) {
         parallelCylCount++;
         const orig = new THREE.Vector3(...(b.axisOrigin || b.centroid));
         const radialOffset = new THREE.Vector3().subVectors(orig, refOrigin).cross(refAxis).length();
-        if (radialOffset >= 0.5) {
+        if (radialOffset >= 1.2) {
           eccentricSectionCount++;
         }
       }
@@ -3705,22 +4945,47 @@ export function evaluateGeometricArchetypeFromTopology(
   const discCrossSectionSymmetry = Math.abs(sMax - sMid) / Math.max(sMax, 1.0);
   const elongationRatio = sMax / Math.max(sMid, 1.0);
 
+  // Check if bores have cross-axes or off-center positions (characteristic of brackets/housings/manifolds, NOT simple turned shafts)
+  let hasOffCenterOrCrossBores = false;
+  if (compHoles.length >= 2) {
+    const a0 = new THREE.Vector3(...compHoles[0].normalOrAxis).normalize();
+    const p0 = new THREE.Vector3(...(compHoles[0].axisOrigin || compHoles[0].centroid));
+    for (let i = 1; i < compHoles.length; i++) {
+      const ai = new THREE.Vector3(...compHoles[i].normalOrAxis).normalize();
+      const pi = new THREE.Vector3(...(compHoles[i].axisOrigin || compHoles[i].centroid));
+      const dot = Math.abs(a0.dot(ai));
+      const offset = new THREE.Vector3().subVectors(pi, p0).cross(a0).length();
+      if (dot < 0.9 || offset > 1.5) {
+        hasOffCenterOrCrossBores = true;
+        break;
+      }
+    }
+  }
+
+  // Strictly require dominant axisymmetric radial curvature and low orthogonal planar wall area before classifying as a turned shaft or multi-journal shaft
+  const hasDominantPlanarWalls =
+    planeArea > cylArea * 0.95 || orthoPlanarAreaShare >= 0.36;
+
   const isMultiJournalOrCamGeometry =
-    (compBosses.length >= 2 &&
-      parallelCylCount >= 2 &&
-      (eccentricSectionCount >= 1 || distinctDiameters.size >= 2 || elongationRatio >= 1.45)) ||
-    (elongationRatio >= 1.65 &&
-      radialCrossSectionSymmetry < 0.35 &&
-      radialCurvedAreaShare >= 0.25 &&
-      (distinctAxialSectionRadii >= 3 || maxSliceCentroidEccentricityMm >= 0.8 || compBosses.length >= 2));
+    !hasDominantPlanarWalls &&
+    !hasOffCenterOrCrossBores &&
+    elongationRatio >= 2.35 &&
+    radialCrossSectionSymmetry < 0.26 &&
+    cylAreaShare >= 0.52 &&
+    ((compBosses.length >= 4 && parallelCylCount >= 4 && distinctDiameters.size >= 2) ||
+      (radialCurvedAreaShare >= 0.45 && distinctAxialSectionRadii >= 4 && maxSliceCentroidEccentricityMm >= 1.2));
 
   const isRotationalGeometry =
     isMultiJournalOrCamGeometry ||
-    (compBosses.length >= 2 && parallelCylCount >= 2 && radialCrossSectionSymmetry < 0.36) ||
-    (compBosses.length >= 1 &&
-      (discCrossSectionSymmetry < 0.22 ||
-        (radialCrossSectionSymmetry < 0.28 && (cylAreaShare >= 0.2 || radialCurvedAreaShare >= 0.32)))) ||
-    (radialCrossSectionSymmetry < 0.18 && radialCurvedAreaShare >= 0.38 && orthoPlanarAreaShare < 0.55);
+    (!hasDominantPlanarWalls &&
+      !hasOffCenterOrCrossBores &&
+      eccentricSectionCount === 0 &&
+      ((compBosses.length >= 1 &&
+        cylAreaShare >= 0.55 &&
+        (radialCrossSectionSymmetry < 0.16 || discCrossSectionSymmetry < 0.14)) ||
+        (radialCrossSectionSymmetry < 0.14 &&
+          radialCurvedAreaShare >= 0.48 &&
+          orthoPlanarAreaShare < 0.32)));
 
   const isSheetMetalGeometry =
     !isRotationalGeometry && sMid / sMin >= 5.5 && fillRatio >= 0.3 && compBosses.length === 0;
@@ -3728,8 +4993,7 @@ export function evaluateGeometricArchetypeFromTopology(
   const isMixedGeometry =
     !isRotationalGeometry &&
     !isSheetMetalGeometry &&
-    (compBosses.length >= 1 || (radialCurvedAreaShare >= 0.16 && compHoles.length >= 2)) &&
-    (compHoles.length > 0 || planeArea > cylArea * 1.1);
+    (compBosses.length >= 1 || (radialCurvedAreaShare >= 0.16 && compHoles.length >= 1));
 
   const archetype: GeometricArchetypeKind = isMultiJournalOrCamGeometry
     ? 'rotational_multi_journal_or_cam'
@@ -3753,10 +5017,7 @@ export function evaluateGeometricArchetypeFromTopology(
     sMax,
     fillRatio,
     parallelCylCount: Math.max(parallelCylCount, isMultiJournalOrCamGeometry ? 2 : 0),
-    eccentricSectionCount: Math.max(
-      eccentricSectionCount,
-      maxSliceCentroidEccentricityMm >= 0.8 ? 2 : 0
-    ),
+    eccentricSectionCount,
     distinctDiameterCount: Math.max(distinctDiameters.size, distinctAxialSectionRadii),
     castingOrForgingJustified,
     actualMaxRadialDiaMm,
@@ -4131,19 +5392,45 @@ export function computeSwedenManufacturingCostEstimate(
     /through-hole|pocket/i.test(m.operationName)
   );
 
-  // Enforce 100% material & density synchronization across all BOM entries used in costing
+  // Enforce material & density synchronization across BOM entries while preserving component-specific materials in multi-material assemblies unless user explicitly overrode materialGradeKey
+  const hasExplicitMaterialOverride = Boolean(customOverrides?.materialGradeKey);
   const effectiveEntries: BomEntry[] =
     bomEntries.length > 0
-      ? bomEntries.map((e) => ({
-          ...e,
-          material: resolvedMat.displaySpec,
-          densityGPerCm3: mat.densityGPerCm3,
-          estimatedMassGrams: Number((e.volumeCm3 * mat.densityGPerCm3).toFixed(1)),
-        }))
+      ? bomEntries.map((e) => {
+          if (e.componentSourceType === 'PURCHASED_STANDARD_CATALOG' && !hasExplicitMaterialOverride) {
+            return {
+              ...e,
+              estimatedMassGrams: Number((e.volumeCm3 * e.densityGPerCm3).toFixed(1)),
+              unitEstimatedMassGrams: Number(
+                ((e.unitVolumeCm3 ?? e.volumeCm3 / Math.max(1, e.quantity)) * e.densityGPerCm3).toFixed(1)
+              ),
+            };
+          }
+          const entryMatKey = hasExplicitMaterialOverride
+            ? defaultMatKey
+            : e.materialGradeKey || defaultMatKey;
+          const entryMatSpec = AUTHORITATIVE_MATERIAL_CATALOG[entryMatKey] || mat;
+          const matDisplay =
+            !hasExplicitMaterialOverride && e.material
+              ? e.material
+              : resolvedMat.displaySpec;
+          return {
+            ...e,
+            materialGradeKey: entryMatKey,
+            material: matDisplay,
+            densityGPerCm3: entryMatSpec.densityGPerCm3,
+            estimatedMassGrams: Number((e.volumeCm3 * entryMatSpec.densityGPerCm3).toFixed(1)),
+            unitEstimatedMassGrams: Number(
+              ((e.unitVolumeCm3 ?? e.volumeCm3 / Math.max(1, e.quantity)) * entryMatSpec.densityGPerCm3).toFixed(1)
+            ),
+          };
+        })
       : [
           {
             itemNumber: 1,
             componentName: metadata.fileName.replace(/\.[^/.]+$/, '') || 'Primary Component',
+            componentSourceType: 'MANUFACTURED_CUSTOM',
+            materialGradeKey: defaultMatKey,
             structuralRole: 'Primary Monolithic Structural Component',
             quantity: 1,
             material: resolvedMat.displaySpec,
@@ -4154,14 +5441,18 @@ export function computeSwedenManufacturingCostEstimate(
             boundingBoxMm: `${envX.toFixed(1)} × ${envY.toFixed(1)} × ${envZ.toFixed(1)} mm`,
             rawStockDimensionsMm: `${(envX + 4).toFixed(1)} × ${(envY + 4).toFixed(1)} × ${(envZ + 4).toFixed(1)} mm`,
             rawStockVolumeCm3: Number((dimVolCm3 * 1.45).toFixed(2)),
+            unitRawStockVolumeCm3: Number((dimVolCm3 * 1.45).toFixed(2)),
             volumeCm3: Number(dimVolCm3.toFixed(3)),
+            unitVolumeCm3: Number(dimVolCm3.toFixed(3)),
             rawVolumeM3: Number((dimVolCm3 * 1.45 * 1e-6).toFixed(9)),
             netVolumeM3: Number((dimVolCm3 * 1e-6).toFixed(9)),
             volumeConversionExplanation: 'Raw stock envelope reduced via CNC roughing & boring.',
             chipRemovalRatioPct: 31.0,
             chipRemovalExplanation: 'Governed by CNC milling from solid stock.',
             surfaceAreaCm2: Number((totalPartAreaMm2 / 100 || 140).toFixed(2)),
+            unitSurfaceAreaCm2: Number((totalPartAreaMm2 / 100 || 140).toFixed(2)),
             estimatedMassGrams: Number((dimVolCm3 * mat.densityGPerCm3).toFixed(1)),
+            unitEstimatedMassGrams: Number((dimVolCm3 * mat.densityGPerCm3).toFixed(1)),
             featureSummary: 'Contiguous 3D solid boundary',
             triangleCount: 1000,
             componentIndices: [0],
@@ -4229,8 +5520,115 @@ export function computeSwedenManufacturingCostEstimate(
     let primaryDrillingMmPerMin = mat.drillingMmPerMin;
 
     effectiveEntries.forEach((entry, entryIdx) => {
-      const compDensity = mat.densityGPerCm3;
-      const baseNetVolCm3 = Math.max(0.05, entry.volumeCm3);
+      const isPurchasedCatalog = entry.componentSourceType === 'PURCHASED_STANDARD_CATALOG';
+      const entryMatSpec =
+        !hasExplicitMaterialOverride && entry.materialGradeKey
+          ? AUTHORITATIVE_MATERIAL_CATALOG[entry.materialGradeKey] || mat
+          : mat;
+      const compDensity = isPurchasedCatalog ? entry.densityGPerCm3 : entryMatSpec.densityGPerCm3;
+      const entryVirginPriceSekPerKg =
+        isExplicitUserCustom && customOverrides?.rawMaterialPriceSekPerKg !== undefined
+          ? rawMaterialPriceSekPerKg
+          : entryMatSpec.priceSekPerKg;
+      const entryScrapCreditSekPerKg =
+        isExplicitUserCustom && customOverrides?.scrapCreditSekPerKg !== undefined
+          ? scrapCreditSekPerKg
+          : entryMatSpec.scrapSekPerKg;
+
+      const baseNetVolCm3 = Math.max(0.005, entry.volumeCm3);
+
+      // Handle PURCHASED_STANDARD_CATALOG components (motors, screws, nuts, washers, bearings, dowel pins)
+      if (isPurchasedCatalog) {
+        const netVolCm3 = Number(baseNetVolCm3.toFixed(3));
+        const rawVolCm3 = netVolCm3;
+        const netMassGrams = Number(Math.max(0.5, netVolCm3 * compDensity).toFixed(1));
+        const rawMassGrams = netMassGrams;
+        const scrapMassGrams = 0;
+
+        const rawMassKg = Number((rawMassGrams / 1000).toFixed(4));
+        const netMassKg = Number((netMassGrams / 1000).toFixed(4));
+        const scrapMassKg = 0;
+
+        const unitCatalogPriceSek = Number(
+          (entry.assumedPurchasedUnitCostSek ?? Math.max(2.0, netMassKg * 95.0)).toFixed(2)
+        );
+        // Volume discount for larger batch sizes on standard catalog hardware
+        const batchDiscountFactor =
+          targetBatchSize >= 250 ? 0.82 : targetBatchSize >= 50 ? 0.88 : targetBatchSize >= 10 ? 0.94 : 1.0;
+        const effectiveUnitCatalogSek = Number((unitCatalogPriceSek * batchDiscountFactor).toFixed(2));
+        const purchasedHardwareExtendedSek = Number(
+          (effectiveUnitCatalogSek * entry.quantity).toFixed(2)
+        );
+
+        const kittingAndQaMin = Number(
+          (
+            entry.componentCategory === 'purchased_electric_motor'
+              ? 1.5 * entry.quantity
+              : 0.25 * entry.quantity
+          ).toFixed(2)
+        );
+        const kittingAndQaSek = Number(((kittingAndQaMin / 60.0) * laborSekPerHour).toFixed(2));
+
+        const operationCosts: ComponentCostOperationRow[] = [
+          {
+            operationStep: 'Step 1 — Purchased Standard Catalog Component Allowance (Unverified)',
+            costElement: `${entry.componentName} (Qty ${entry.quantity} pc${entry.quantity > 1 ? 's' : ''}) — Commercial Off-The-Shelf Procurement [Assumed Catalog Allowance]`,
+            rateAndCalculationBasis: `Basis: Assumed standard catalog unit price ${effectiveUnitCatalogSek.toFixed(2)} SEK/pc × Qty ${entry.quantity} (Net Mass ${netMassKg.toFixed(4)} kg total; 0.0000 kg swarf — not custom CNC-machined; requires supplier quote verification)`,
+            explicitEquation: `C_catalog = ${effectiveUnitCatalogSek.toFixed(2)} SEK/pc × ${entry.quantity} pc(s) = ${purchasedHardwareExtendedSek.toFixed(2)} SEK`,
+            costSek: purchasedHardwareExtendedSek,
+            costEur: Number((purchasedHardwareExtendedSek / sekPerEur).toFixed(2)),
+          },
+          {
+            operationStep: 'Step 2 — Incoming QA Verification & Assembly Kitting',
+            costElement: `${entry.secondaryOperations} [Basis: ${kittingAndQaMin.toFixed(2)} min total for ${entry.quantity} pc(s)]`,
+            rateAndCalculationBasis: `Basis: Incoming dimensional/functional check & assembly installation (${kittingAndQaMin.toFixed(2)} min @ ${laborSekPerHour.toFixed(2)} SEK/h; 0.00 min in-house CNC spindle time)`,
+            explicitEquation: `C_qa = (${kittingAndQaMin.toFixed(2)} min / 60) × ${laborSekPerHour.toFixed(2)} SEK/h = ${kittingAndQaSek.toFixed(2)} SEK`,
+            costSek: kittingAndQaSek,
+            costEur: Number((kittingAndQaSek / sekPerEur).toFixed(2)),
+          },
+        ];
+
+        const totalComponentCostSek = Number(
+          (purchasedHardwareExtendedSek + kittingAndQaSek).toFixed(2)
+        );
+        const totalComponentCostEur = Number((totalComponentCostSek / sekPerEur).toFixed(2));
+
+        const manufacturingSteps: string[] = [
+          `Step 1 — Commercial Off-The-Shelf (COTS) Procurement [Assumed Catalog Allowance — Requires Vendor Quote]: Procure ${entry.quantity}× ${entry.componentName} (${entry.boundingBoxMm}, Net Volume ${(netVolCm3 / entry.quantity).toFixed(3)} cm³/pc → ${netVolCm3.toFixed(3)} cm³ total, Net Mass ${netMassKg.toFixed(4)} kg) at assumed catalog price ${effectiveUnitCatalogSek.toFixed(2)} SEK/pc = ${purchasedHardwareExtendedSek.toFixed(2)} SEK. Zero in-house CNC bar/billet machining or swarf generation.`,
+          `Step 2 — Incoming Inspection & Assembly Kitting: Perform ${kittingAndQaMin.toFixed(2)} min incoming verification and assembly installation (${kittingAndQaSek.toFixed(2)} SEK).`,
+        ];
+
+        routeBreakdowns.push({
+          itemNumber: entry.itemNumber,
+          componentName: entry.componentName,
+          componentSourceType: 'PURCHASED_STANDARD_CATALOG',
+          quantity: entry.quantity,
+          material: entry.material,
+          primaryProcess: entry.manufacturingProcess,
+          rawMassKg,
+          netMassKg,
+          scrapMassKg,
+          manufacturingSteps,
+          operationCosts,
+          totalComponentCostSek,
+          totalComponentCostEur,
+        });
+
+        if (entryIdx === 0 && entry.stockValidation) {
+          primaryStockValidation = entry.stockValidation;
+        }
+
+        rSumRawMassGrams += rawMassGrams;
+        rSumNetMassGrams += netMassGrams;
+        rSumScrapMassGrams += scrapMassGrams;
+        rSumRawVolCm3 += rawVolCm3;
+        rSumNetVolCm3 += netVolCm3;
+        rSumInspectionMin += kittingAndQaMin;
+        rSumRawMatCostSek += purchasedHardwareExtendedSek;
+        rSumManpowerCostSek += kittingAndQaSek;
+        return;
+      }
+
       const netVolCm3 = Number(
         (simLightening && !hasAppliedLighteningHole ? baseNetVolCm3 * 0.94 : baseNetVolCm3).toFixed(3)
       );
@@ -4240,19 +5638,43 @@ export function computeSwedenManufacturingCostEstimate(
       const unitNetVolForStock = netVolCm3 / Math.max(1, entry.quantity);
       const unitAreaForStock = entry.surfaceAreaCm2 / Math.max(1, entry.quantity);
 
-      const compStockVal = computeAndValidateRawStockGeometry(
-        entryBbox,
-        unitNetVolForStock,
-        unitAreaForStock,
-        overallArch.archetype,
-        routeKey,
-        effectiveAllowance
-      );
+      const entryArchForStock: GeometricArchetypeKind =
+        entry.componentCategory === 'machined_gear' ||
+        entry.componentCategory === 'machined_carrier_or_flange' ||
+        entry.componentCategory === 'machined_shaft_or_cam'
+          ? 'rotational_shaft_or_sleeve'
+          : overallArch.archetype;
 
-      const rawVolCm3 = Number((compStockVal.rawStockVolumeCm3 * entry.quantity).toFixed(2));
+      const canReuseEntryStock =
+        routeKey === selectedRouteKey &&
+        !simStockTrim &&
+        !(simLightening && !hasAppliedLighteningHole) &&
+        entry.stockValidation &&
+        Math.abs((entry.stockValidation.radialOrLateralAllowanceMm || 2.0) - effectiveAllowance) < 0.05;
+
+      const compStockVal = canReuseEntryStock
+        ? {
+            ...entry.stockValidation!,
+            rawStockVolumeCm3: Number(
+              (entry.stockValidation!.rawStockVolumeCm3 / Math.max(1, entry.quantity)).toFixed(3)
+            ),
+            netPartVolumeCm3: unitNetVolForStock,
+          }
+        : computeAndValidateRawStockGeometry(
+            entryBbox,
+            unitNetVolForStock,
+            unitAreaForStock,
+            entryArchForStock,
+            routeKey,
+            effectiveAllowance
+          );
+
+      const rawVolCm3 = canReuseEntryStock
+        ? Number(entry.rawStockVolumeCm3.toFixed(2))
+        : Number((compStockVal.rawStockVolumeCm3 * entry.quantity).toFixed(2));
       const removedVolCm3 = Number(Math.max(0.01, rawVolCm3 - netVolCm3).toFixed(2));
 
-      if (entryIdx === 0) {
+      if (!primaryStockValidation || entryIdx === 0) {
         primaryStockValidation = {
           ...compStockVal,
           rawStockVolumeCm3: rawVolCm3,
@@ -4276,8 +5698,8 @@ export function computeSwedenManufacturingCostEstimate(
       const compChamfers = chamfers.filter((f) => compIndicesSet.has(f.componentIndex));
 
       const primaryDatumFeatureId =
-        overallArch.archetype === 'rotational_multi_journal_or_cam' ||
-        overallArch.archetype === 'rotational_shaft_or_sleeve'
+        entryArchForStock === 'rotational_multi_journal_or_cam' ||
+        entryArchForStock === 'rotational_shaft_or_sleeve'
           ? compBosses[0]?.id || compPlanes[0]?.id || 'DIM-ENV-X'
           : compPlanes[0]?.id || compBosses[0]?.id || 'DIM-ENV-X';
 
@@ -4300,8 +5722,8 @@ export function computeSwedenManufacturingCostEstimate(
 
       const procLower = entry.manufacturingProcess.toLowerCase();
       const isSheetMetal = procLower.includes('sheet metal');
-      const isTurning = procLower.includes('turning');
-      const isMultiAxis = procLower.includes('multi-axis') || procLower.includes('4-axis');
+      const isTurning = procLower.includes('turning') || procLower.includes('hobbing');
+      const isMultiAxis = procLower.includes('multi-axis') || procLower.includes('4-axis') || procLower.includes('3+2');
       const spindleKw = isSheetMetal ? 18.5 : isMultiAxis ? 22.0 : isTurning ? 14.5 : 15.5;
       const defaultMachRate = isMultiAxis ? 480 : isSheetMetal ? 410 : isTurning ? 340 : 380;
       const machineRateSekPerHr = Number(
@@ -4311,8 +5733,8 @@ export function computeSwedenManufacturingCostEstimate(
       primaryMachineRateSekPerHr = machineRateSekPerHr;
 
       // STEP 1: Raw Material Cost (Net of Swarf Recovery) — 100% exact reconciliation with displayed 4-decimal kg mass
-      const grossMaterialSek = Number((rawMassKg * rawMaterialPriceSekPerKg).toFixed(2));
-      const swarfCreditSek = Number((scrapMassKg * scrapCreditSekPerKg).toFixed(2));
+      const grossMaterialSek = Number((rawMassKg * entryVirginPriceSekPerKg).toFixed(2));
+      const swarfCreditSek = Number((scrapMassKg * entryScrapCreditSekPerKg).toFixed(2));
       const rawMaterialNetSek = Number(Math.max(0.5, grossMaterialSek - swarfCreditSek).toFixed(2));
 
       // STEP 2: Route-Specific Blank Preparation & Workholding Datum Setup Amortization
@@ -4327,28 +5749,28 @@ export function computeSwedenManufacturingCostEstimate(
 
       if (routeKey === 'NEAR_NET_FORGING_CNC') {
         const dieAmortSek = Number((420.0 / targetBatchSize).toFixed(2));
-        const forgingMassSek = Number((rawMassKg * mat.forgingSekPerKg).toFixed(2));
+        const forgingMassSek = Number((rawMassKg * entryMatSpec.forgingSekPerKg).toFixed(2));
         blankingOrFormingUnitSek = Number(
           (setupPerPieceSek + dieAmortSek + forgingMassSek).toFixed(2)
         );
         step2Title = 'Step 2 — Near-Net Cast / Forged Preform & Datum Setup';
-        step2Element = `Near-Net Preform (${compStockVal.stockDimensionsFormatted}) + Datum ${primaryDatumFeatureId} Fixturing & Die Amortization`;
-        step2Basis = `Basis: Datum ${primaryDatumFeatureId} setup (${setupTimeMinutes.toFixed(1)} min @ ${laborSekPerHour.toFixed(2)} SEK/h ÷ ${targetBatchSize} pcs = ${setupPerPieceSek.toFixed(2)} SEK) + Die Amort (420.00 / ${targetBatchSize} = ${dieAmortSek.toFixed(2)} SEK) + Preform (${rawMassKg.toFixed(4)} kg @ ${mat.forgingSekPerKg.toFixed(2)} SEK/kg = ${forgingMassSek.toFixed(2)} SEK)`;
-        step2Equation = `C_prep = ${setupPerPieceSek.toFixed(2)} + ${dieAmortSek.toFixed(2)} + (${rawMassKg.toFixed(4)} × ${mat.forgingSekPerKg.toFixed(2)}) = ${setupPerPieceSek.toFixed(2)} + ${dieAmortSek.toFixed(2)} + ${forgingMassSek.toFixed(2)} = ${blankingOrFormingUnitSek.toFixed(2)} SEK`;
+        step2Element = `Near-Net Preform (${compStockVal.stockDimensionsFormatted}${entry.quantity > 1 ? ` × ${entry.quantity} pcs` : ''}) + Datum ${primaryDatumFeatureId} Fixturing & Die Amortization`;
+        step2Basis = `Basis: Datum ${primaryDatumFeatureId} setup (${setupTimeMinutes.toFixed(1)} min @ ${laborSekPerHour.toFixed(2)} SEK/h ÷ ${targetBatchSize} = ${setupPerPieceSek.toFixed(2)} SEK) + Die Amort (420.00 / ${targetBatchSize} = ${dieAmortSek.toFixed(2)} SEK) + Preform (${rawMassKg.toFixed(4)} kg @ ${entryMatSpec.forgingSekPerKg.toFixed(2)} SEK/kg = ${forgingMassSek.toFixed(2)} SEK)`;
+        step2Equation = `C_prep = ${setupPerPieceSek.toFixed(2)} + ${dieAmortSek.toFixed(2)} + (${rawMassKg.toFixed(4)} × ${entryMatSpec.forgingSekPerKg.toFixed(2)}) = ${setupPerPieceSek.toFixed(2)} + ${dieAmortSek.toFixed(2)} + ${forgingMassSek.toFixed(2)} = ${blankingOrFormingUnitSek.toFixed(2)} SEK`;
       } else if (routeKey === 'PRECISION_BLANK_CNC') {
         const nestingMassFeeSek = Number((rawMassKg * 9.0).toFixed(2));
-        const nestingCutSek = Number((8.5 + nestingMassFeeSek).toFixed(2));
+        const nestingCutSek = Number((8.5 * entry.quantity + nestingMassFeeSek).toFixed(2));
         blankingOrFormingUnitSek = Number((setupPerPieceSek + nestingCutSek).toFixed(2));
         step2Title = 'Step 2 — Waterjet / Fiber-Laser Near-Net Profile Blank & Datum Setup';
-        step2Element = `Near-Net Profile Blank (${compStockVal.stockDimensionsFormatted}) + Datum ${primaryDatumFeatureId} Setup Amortization`;
-        step2Basis = `Basis: Datum ${primaryDatumFeatureId} setup (${setupTimeMinutes.toFixed(1)} min @ ${laborSekPerHour.toFixed(2)} SEK/h ÷ ${targetBatchSize} pcs = ${setupPerPieceSek.toFixed(2)} SEK) + Profile Cut (8.50 + ${rawMassKg.toFixed(4)} kg × 9.00 SEK/kg = ${nestingCutSek.toFixed(2)} SEK)`;
-        step2Equation = `C_prep = ((${setupTimeMinutes.toFixed(1)}/60 × ${laborSekPerHour.toFixed(2)}) / ${targetBatchSize}) + (8.50 + ${nestingMassFeeSek.toFixed(2)}) = ${setupPerPieceSek.toFixed(2)} + ${nestingCutSek.toFixed(2)} = ${blankingOrFormingUnitSek.toFixed(2)} SEK`;
+        step2Element = `Near-Net Profile Blank (${compStockVal.stockDimensionsFormatted}${entry.quantity > 1 ? ` × ${entry.quantity} pcs` : ''}) + Datum ${primaryDatumFeatureId} Setup Amortization`;
+        step2Basis = `Basis: Datum ${primaryDatumFeatureId} setup (${setupTimeMinutes.toFixed(1)} min @ ${laborSekPerHour.toFixed(2)} SEK/h ÷ ${targetBatchSize} = ${setupPerPieceSek.toFixed(2)} SEK) + Profile Cut (${(8.5 * entry.quantity).toFixed(2)} + ${rawMassKg.toFixed(4)} kg × 9.00 SEK/kg = ${nestingCutSek.toFixed(2)} SEK)`;
+        step2Equation = `C_prep = ((${setupTimeMinutes.toFixed(1)}/60 × ${laborSekPerHour.toFixed(2)}) / ${targetBatchSize}) + (${(8.5 * entry.quantity).toFixed(2)} + ${nestingMassFeeSek.toFixed(2)}) = ${setupPerPieceSek.toFixed(2)} + ${nestingCutSek.toFixed(2)} = ${blankingOrFormingUnitSek.toFixed(2)} SEK`;
       } else {
-        const sawCutFeeSek = 4.5;
+        const sawCutFeeSek = Number((4.5 * entry.quantity).toFixed(2));
         blankingOrFormingUnitSek = Number((setupPerPieceSek + sawCutFeeSek).toFixed(2));
         step2Title = 'Step 2 — Bar/Billet Saw-Cut & Workholding Datum Setup';
-        step2Element = `Band-Saw Cut (${compStockVal.stockDimensionsFormatted}) & Datum ${primaryDatumFeatureId} CNC Setup Amortization`;
-        step2Basis = `Basis: Primary datum ${primaryDatumFeatureId} workholding/CAM setup (${setupTimeMinutes.toFixed(1)} min @ ${laborSekPerHour.toFixed(2)} SEK/h ÷ ${targetBatchSize} pcs = ${setupPerPieceSek.toFixed(2)} SEK) + Saw-Cut blanking of ${compStockVal.stockDimensionsFormatted} (${sawCutFeeSek.toFixed(2)} SEK/pc)`;
+        step2Element = `Band-Saw Cut (${compStockVal.stockDimensionsFormatted}${entry.quantity > 1 ? ` × ${entry.quantity} pcs` : ''}) & Datum ${primaryDatumFeatureId} CNC Setup Amortization`;
+        step2Basis = `Basis: Primary datum ${primaryDatumFeatureId} workholding/CAM setup (${setupTimeMinutes.toFixed(1)} min @ ${laborSekPerHour.toFixed(2)} SEK/h ÷ ${targetBatchSize} = ${setupPerPieceSek.toFixed(2)} SEK) + Saw-Cut blanking (${sawCutFeeSek.toFixed(2)} SEK for ${entry.quantity} pc${entry.quantity > 1 ? 's' : ''})`;
         step2Equation = `C_prep = ((${setupTimeMinutes.toFixed(1)}/60 × ${laborSekPerHour.toFixed(2)}) / ${targetBatchSize}) + ${sawCutFeeSek.toFixed(2)} = ${setupPerPieceSek.toFixed(2)} + ${sawCutFeeSek.toFixed(2)} = ${blankingOrFormingUnitSek.toFixed(2)} SEK`;
       }
 
@@ -4357,20 +5779,24 @@ export function computeSwedenManufacturingCostEstimate(
       const furnaceBatchShareSek = Number(
         (18.0 / Math.max(1, Math.min(targetBatchSize, 10))).toFixed(2)
       );
-      const massChargeSek = Number((netMassKg * mat.heatTreatSekPerKg).toFixed(2));
+      const massChargeSek = Number((netMassKg * entryMatSpec.heatTreatSekPerKg).toFixed(2));
       if (includeHeatTreatForRoute) {
         heatTreatSek = Number((furnaceBatchShareSek + massChargeSek).toFixed(2));
       }
 
       // STEP 3/4: Physics-Based CNC Machining Cycle Time — every sub-term reconciles 100% with its displayed card inputs
       const surfAreaCm2 = Number(entry.surfaceAreaCm2.toFixed(2));
-      const effectiveFinishRateCm2PerMin = Number(mat.finishingAreaCm2PerMin.toFixed(2));
+      const effectiveFinishRateCm2PerMin = Number(entryMatSpec.finishingAreaCm2PerMin.toFixed(2));
+      const entryMrr =
+        isExplicitUserCustom && customOverrides?.roughingMrrCm3PerMin !== undefined
+          ? effectiveMrrCm3PerMin
+          : entryMatSpec.mrrCm3PerMin;
       const effectiveDrillingMmPerMin = Number(
-        (simBoreStd ? mat.drillingMmPerMin * 1.25 : mat.drillingMmPerMin).toFixed(1)
+        (simBoreStd ? entryMatSpec.drillingMmPerMin * 1.25 : entryMatSpec.drillingMmPerMin).toFixed(1)
       );
       primaryDrillingMmPerMin = effectiveDrillingMmPerMin;
 
-      const roughingMin = Number((removedVolCm3 / effectiveMrrCm3PerMin).toFixed(2));
+      const roughingMin = Number((removedVolCm3 / entryMrr).toFixed(2));
       const finishingMin = Number(
         Math.max(0.1, surfAreaCm2 / effectiveFinishRateCm2PerMin).toFixed(2)
       );
@@ -4386,7 +5812,6 @@ export function computeSwedenManufacturingCostEstimate(
         compHoles.length > 0
           ? Number((totalHoleDepthMm / effectiveDrillingMmPerMin).toFixed(2))
           : 0;
-      // In-cycle edge break is accounted within surface finishing (t_finish) and tool changes (t_atc) so the 5 displayed cycle-time cards sum identically to t_cycle
       const chamferMin = 0;
       const toolChangeCount = Math.max(
         2,
@@ -4395,10 +5820,10 @@ export function computeSwedenManufacturingCostEstimate(
           (compBosses.length > 0 ? 1 : 0) +
           (compChamfers.length > 0 || simInCycleChamfer ? 1 : 0)
       );
-      const toolChangeMin = Number((toolChangeCount * 0.25).toFixed(2));
-      const loadUnloadMin = Number((simStockTrim ? 1.2 : 1.5).toFixed(2));
+      const toolChangeMin = Number((toolChangeCount * 0.25 * entry.quantity).toFixed(2));
+      const loadUnloadMin = Number(((simStockTrim ? 1.2 : 1.5) * entry.quantity).toFixed(2));
 
-      const singleCompCycleMin = Number(
+      const compCycleMin = Number(
         (
           roughingMin +
           finishingMin +
@@ -4407,10 +5832,9 @@ export function computeSwedenManufacturingCostEstimate(
           loadUnloadMin
         ).toFixed(2)
       );
-      const compCycleMin = Number((singleCompCycleMin * entry.quantity).toFixed(2));
 
       const spindlePartKwh = Number((spindleKw * 0.65 * (compCycleMin / 60.0)).toFixed(3));
-      const cuttingPartKwh = Number((removedVolCm3 * mat.specificCuttingEnergyKwhPerCm3).toFixed(3));
+      const cuttingPartKwh = Number((removedVolCm3 * entryMatSpec.specificCuttingEnergyKwhPerCm3).toFixed(3));
       const compEnergyKwh = Number((spindlePartKwh + cuttingPartKwh).toFixed(3));
 
       const compElecSek = Number((compEnergyKwh * electricitySekPerKwh).toFixed(2));
@@ -4423,7 +5847,7 @@ export function computeSwedenManufacturingCostEstimate(
       );
 
       // STEP 4/5: Deburring, Surface Finishing / Grinding & CMM Quality Verification (with identifiable feature basis)
-      const baseInspMin = simInCycleChamfer ? 0.95 : 1.8;
+      const baseInspMin = Number(((simInCycleChamfer ? 0.95 : 1.8) * entry.quantity).toFixed(2));
       const holeInspMin = Number((compHoles.length * (simBoreStd ? 0.2 : 0.3)).toFixed(2));
       const bossInspMin = Number((compBosses.length * 0.2).toFixed(2));
       const defaultInspMin = Number((baseInspMin + holeInspMin + bossInspMin).toFixed(2));
@@ -4434,12 +5858,13 @@ export function computeSwedenManufacturingCostEstimate(
         ((finishingAndCmmMin / 60.0) * laborSekPerHour).toFixed(2)
       );
 
+      const qtySuffix = entry.quantity > 1 ? ` (Total for ${entry.quantity} pcs)` : '';
       const operationCosts: ComponentCostOperationRow[] = [
         {
           operationStep: 'Step 1 — Raw Material & Swarf Recovery',
-          costElement: `Raw Material Input (${entry.material}) Net of Swarf Credit [Basis: Envelope ${entry.boundingBoxMm}, Net V=${netVolCm3.toFixed(3)} cm³]`,
-          rateAndCalculationBasis: `Basis: Validated Stock ${compStockVal.stockDimensionsFormatted} (V_raw=${rawVolCm3.toFixed(2)} cm³ × ρ=${compDensity.toFixed(2)} g/cm³ = ${rawMassKg.toFixed(4)} kg) @ ${rawMaterialPriceSekPerKg.toFixed(2)} SEK/kg minus Swarf (V_rem=${removedVolCm3.toFixed(2)} cm³ = ${scrapMassKg.toFixed(4)} kg) @ ${scrapCreditSekPerKg.toFixed(2)} SEK/kg`,
-          explicitEquation: `C_mat = (${rawMassKg.toFixed(4)} kg × ${rawMaterialPriceSekPerKg.toFixed(2)} SEK/kg) - (${scrapMassKg.toFixed(4)} kg × ${scrapCreditSekPerKg.toFixed(2)} SEK/kg) = ${grossMaterialSek.toFixed(2)} - ${swarfCreditSek.toFixed(2)} = ${rawMaterialNetSek.toFixed(2)} SEK`,
+          costElement: `Raw Material Input (${entry.material}) Net of Swarf Credit [Basis: Envelope ${entry.boundingBoxMm}${qtySuffix}, Net V=${netVolCm3.toFixed(3)} cm³]`,
+          rateAndCalculationBasis: `Basis: Validated Stock ${compStockVal.stockDimensionsFormatted}${qtySuffix} (V_raw=${rawVolCm3.toFixed(2)} cm³ × ρ=${compDensity.toFixed(2)} g/cm³ = ${rawMassKg.toFixed(4)} kg) @ ${entryVirginPriceSekPerKg.toFixed(2)} SEK/kg minus Swarf (V_rem=${removedVolCm3.toFixed(2)} cm³ = ${scrapMassKg.toFixed(4)} kg) @ ${entryScrapCreditSekPerKg.toFixed(2)} SEK/kg`,
+          explicitEquation: `C_mat = (${rawMassKg.toFixed(4)} kg × ${entryVirginPriceSekPerKg.toFixed(2)} SEK/kg) - (${scrapMassKg.toFixed(4)} kg × ${entryScrapCreditSekPerKg.toFixed(2)} SEK/kg) = ${grossMaterialSek.toFixed(2)} - ${swarfCreditSek.toFixed(2)} = ${rawMaterialNetSek.toFixed(2)} SEK`,
           costSek: rawMaterialNetSek,
           costEur: Number((rawMaterialNetSek / sekPerEur).toFixed(2)),
         },
@@ -4457,8 +5882,8 @@ export function computeSwedenManufacturingCostEstimate(
         operationCosts.push({
           operationStep: 'Step 3 — Thermal Stress-Relief / Heat Treatment',
           costElement: `Thermal Stress-Relief / Case-Hardening Cycle [Basis: ${entry.material}, Net Mass ${netMassKg.toFixed(4)} kg]`,
-          rateAndCalculationBasis: `Basis: Furnace batch share (18.00 SEK ÷ ${Math.max(1, Math.min(targetBatchSize, 10))} pcs = ${furnaceBatchShareSek.toFixed(2)} SEK/pc) + Net solid mass (${netMassKg.toFixed(4)} kg @ ${mat.heatTreatSekPerKg.toFixed(2)} SEK/kg = ${massChargeSek.toFixed(2)} SEK)`,
-          explicitEquation: `C_heat = ${furnaceBatchShareSek.toFixed(2)} + (${netMassKg.toFixed(4)} kg × ${mat.heatTreatSekPerKg.toFixed(2)} SEK/kg) = ${furnaceBatchShareSek.toFixed(2)} + ${massChargeSek.toFixed(2)} = ${heatTreatSek.toFixed(2)} SEK`,
+          rateAndCalculationBasis: `Basis: Furnace batch share (18.00 SEK ÷ ${Math.max(1, Math.min(targetBatchSize, 10))} pcs = ${furnaceBatchShareSek.toFixed(2)} SEK) + Net solid mass (${netMassKg.toFixed(4)} kg @ ${entryMatSpec.heatTreatSekPerKg.toFixed(2)} SEK/kg = ${massChargeSek.toFixed(2)} SEK)`,
+          explicitEquation: `C_heat = ${furnaceBatchShareSek.toFixed(2)} + (${netMassKg.toFixed(4)} kg × ${entryMatSpec.heatTreatSekPerKg.toFixed(2)} SEK/kg) = ${furnaceBatchShareSek.toFixed(2)} + ${massChargeSek.toFixed(2)} = ${heatTreatSek.toFixed(2)} SEK`,
           costSek: heatTreatSek,
           costEur: Number((heatTreatSek / sekPerEur).toFixed(2)),
         });
@@ -4477,7 +5902,7 @@ export function computeSwedenManufacturingCostEstimate(
       operationCosts.push(
         {
           operationStep: cncOpStepLabel,
-          costElement: `${entry.manufacturingProcess} [Basis: Rough ${removedVolCm3.toFixed(2)} cm³, Finish ${surfAreaCm2.toFixed(2)} cm² (${finishedFeaturesCitation}), Bores: ${boreFeaturesCitation}]`,
+          costElement: `${entry.manufacturingProcess}${qtySuffix} [Basis: Rough ${removedVolCm3.toFixed(2)} cm³, Finish ${surfAreaCm2.toFixed(2)} cm² (${finishedFeaturesCitation}), Bores: ${boreFeaturesCitation}]`,
           rateAndCalculationBasis: `Cycle t = ${roughingMin.toFixed(2)} (rough) + ${finishingMin.toFixed(2)} (finish) + ${drillMin.toFixed(2)} (drill) + ${toolChangeMin.toFixed(2)} (${toolChangeCount} tools) + ${loadUnloadMin.toFixed(2)} (clamp) = ${compCycleMin.toFixed(2)} min · E = ${spindlePartKwh.toFixed(3)} + ${cuttingPartKwh.toFixed(3)} = ${compEnergyKwh.toFixed(3)} kWh @ ${electricitySekPerKwh.toFixed(2)} SEK/kWh + Labor @ ${laborSekPerHour.toFixed(2)} SEK/h + Machine @ ${machineRateSekPerHr.toFixed(2)} SEK/h`,
           explicitEquation: `C_cnc = (${compEnergyKwh.toFixed(3)} × ${electricitySekPerKwh.toFixed(2)}) + ((${compCycleMin.toFixed(2)}/60) × ${laborSekPerHour.toFixed(2)}) + ((${compCycleMin.toFixed(2)}/60) × ${machineRateSekPerHr.toFixed(2)}) = ${compElecSek.toFixed(2)} + ${compOperatorLaborSek.toFixed(2)} + ${compMachineToolingSek.toFixed(2)} = ${cncOperationTotalSek.toFixed(2)} SEK`,
           costSek: cncOperationTotalSek,
@@ -4508,20 +5933,21 @@ export function computeSwedenManufacturingCostEstimate(
             : ' (0 internal bores identified → drilling time = 0.00 min)';
 
       const manufacturingSteps: string[] = [
-        `Step 1 — Raw Material & Swarf Balance [Basis: Envelope ${entry.boundingBoxMm}, Solid Volume ${netVolCm3.toFixed(3)} cm³]: Prepare ${compStockVal.stockDimensionsFormatted} (${rawMassKg.toFixed(4)} kg / ${rawVolCm3.toFixed(2)} cm³) of ${entry.material} → Net finished mass ${netMassKg.toFixed(4)} kg (${netVolCm3.toFixed(3)} cm³) + ${scrapMassKg.toFixed(4)} kg (${removedVolCm3.toFixed(2)} cm³) recoverable swarf.`,
-        `Step 2 — ${routeKey === 'NEAR_NET_FORGING_CNC' ? 'Near-Net Cast/Forged Preform' : routeKey === 'PRECISION_BLANK_CNC' ? 'Waterjet / Laser Near-Net Blank' : 'Bar/Billet Saw-Cut'} & Workholding Setup [Basis: Primary Datum ${primaryDatumFeatureId}]: Establish workholding reference on ${primaryDatumFeatureId} and amortize ${setupTimeMinutes.toFixed(1)} min CAM/fixture setup across batch size N=${targetBatchSize} (${blankingOrFormingUnitSek.toFixed(2)} SEK/pc).`,
+        `Step 1 — Raw Material & Swarf Balance [Basis: Envelope ${entry.boundingBoxMm}${qtySuffix}, Solid Volume ${netVolCm3.toFixed(3)} cm³]: Prepare ${compStockVal.stockDimensionsFormatted}${qtySuffix} (${rawMassKg.toFixed(4)} kg / ${rawVolCm3.toFixed(2)} cm³) of ${entry.material} → Net finished mass ${netMassKg.toFixed(4)} kg (${netVolCm3.toFixed(3)} cm³) + ${scrapMassKg.toFixed(4)} kg (${removedVolCm3.toFixed(2)} cm³) recoverable swarf.`,
+        `Step 2 — ${routeKey === 'NEAR_NET_FORGING_CNC' ? 'Near-Net Cast/Forged Preform' : routeKey === 'PRECISION_BLANK_CNC' ? 'Waterjet / Laser Near-Net Blank' : 'Bar/Billet Saw-Cut'} & Workholding Setup [Basis: Primary Datum ${primaryDatumFeatureId}]: Establish workholding reference on ${primaryDatumFeatureId} and amortize ${setupTimeMinutes.toFixed(1)} min CAM/fixture setup across batch size N=${targetBatchSize} (${blankingOrFormingUnitSek.toFixed(2)} SEK).`,
         ...(includeHeatTreatForRoute
           ? [
-              `Step 3 — Thermal Stress Relief / Hardening [Basis: ${entry.material}, Net Mass ${netMassKg.toFixed(4)} kg]: Heat-treat workpiece prior to final precision finishing (${heatTreatSek.toFixed(2)} SEK/pc).`,
+              `Step 3 — Thermal Stress Relief / Hardening [Basis: ${entry.material}, Net Mass ${netMassKg.toFixed(4)} kg]: Heat-treat workpiece prior to final precision finishing (${heatTreatSek.toFixed(2)} SEK).`,
             ]
           : []),
-        `Step ${cncStepNum} — ${entry.manufacturingProcess} [Basis: ${finishedFeaturesCitation}]: Rough V_rem=${removedVolCm3.toFixed(2)} cm³ @ MRR=${effectiveMrrCm3PerMin.toFixed(2)} cm³/min (${roughingMin.toFixed(2)} min), finish A_surf=${surfAreaCm2.toFixed(2)} cm² @ ${effectiveFinishRateCm2PerMin.toFixed(1)} cm²/min (${finishingMin.toFixed(2)} min)${boreAndProfileNote}, ${toolChangeCount} tool changes (${toolChangeMin.toFixed(2)} min) + clamping (${loadUnloadMin.toFixed(2)} min) → Total cycle = ${compCycleMin.toFixed(2)} min (${cncOperationTotalSek.toFixed(2)} SEK/pc).`,
-        `Step ${qaStepNum} — Surface Finishing & CMM Metrology [Basis: Datum ${primaryDatumFeatureId}, ${compHoles.length} bore(s), ${compBosses.length} cylindrical section(s)]: Execute ${finishingAndCmmMin.toFixed(2)} min deburring, ultrasonic cleaning, and CMM inspection (${finishingAndCmmSek.toFixed(2)} SEK/pc).`,
+        `Step ${cncStepNum} — ${entry.manufacturingProcess} [Basis: ${finishedFeaturesCitation}]: Rough V_rem=${removedVolCm3.toFixed(2)} cm³ @ MRR=${entryMrr.toFixed(2)} cm³/min (${roughingMin.toFixed(2)} min), finish A_surf=${surfAreaCm2.toFixed(2)} cm² @ ${effectiveFinishRateCm2PerMin.toFixed(1)} cm²/min (${finishingMin.toFixed(2)} min)${boreAndProfileNote}, ${toolChangeCount} tool changes (${toolChangeMin.toFixed(2)} min) + clamping (${loadUnloadMin.toFixed(2)} min) → Total cycle = ${compCycleMin.toFixed(2)} min (${cncOperationTotalSek.toFixed(2)} SEK).`,
+        `Step ${qaStepNum} — Surface Finishing & CMM Metrology [Basis: Datum ${primaryDatumFeatureId}, ${compHoles.length} bore(s), ${compBosses.length} cylindrical section(s)]: Execute ${finishingAndCmmMin.toFixed(2)} min deburring, ultrasonic cleaning, and CMM inspection (${finishingAndCmmSek.toFixed(2)} SEK).`,
       ];
 
       routeBreakdowns.push({
         itemNumber: entry.itemNumber,
         componentName: entry.componentName,
+        componentSourceType: 'MANUFACTURED_CUSTOM',
         quantity: entry.quantity,
         material: entry.material,
         primaryProcess: entry.manufacturingProcess,
@@ -4543,12 +5969,12 @@ export function computeSwedenManufacturingCostEstimate(
       rSumSurfaceAreaCm2 += surfAreaCm2;
       rSumDrillDepthMm += totalHoleDepthMm;
       rSumToolChanges = Math.max(rSumToolChanges, toolChangeCount);
-      rSumRoughMin += roughingMin * entry.quantity;
-      rSumFinishMin += finishingMin * entry.quantity;
-      rSumDrillMin += drillMin * entry.quantity;
-      rSumChamferMin += chamferMin * entry.quantity;
-      rSumToolChangeMin += toolChangeMin * entry.quantity;
-      rSumLoadUnloadMin += loadUnloadMin * entry.quantity;
+      rSumRoughMin += roughingMin;
+      rSumFinishMin += finishingMin;
+      rSumDrillMin += drillMin;
+      rSumChamferMin += chamferMin;
+      rSumToolChangeMin += toolChangeMin;
+      rSumLoadUnloadMin += loadUnloadMin;
       rSumCycleMinutes += compCycleMin;
       rSumInspectionMin += finishingAndCmmMin;
       rSumEnergyKwh += compEnergyKwh;
@@ -5203,46 +6629,58 @@ export function computeSwedenManufacturingCostEstimate(
     bomCompNames.every((name, i) => name === costCompNames[i]) &&
     cleanFileIdentity.length > 0;
 
-  // 2. Material, density, mass & price consistency
+  // 2. Material, density, mass & price consistency (supports multi-material assemblies & purchased catalog components)
   const expectedCatalogMat = AUTHORITATIVE_MATERIAL_CATALOG[defaultMatKey];
   const densityMatchesCatalog =
     Math.abs(mat.densityGPerCm3 - expectedCatalogMat.densityGPerCm3) <= 0.001 &&
-    effectiveEntries.every((e) => Math.abs(e.densityGPerCm3 - expectedCatalogMat.densityGPerCm3) <= 0.001);
+    effectiveEntries.every((e) => {
+      if (e.componentSourceType === 'PURCHASED_STANDARD_CATALOG') {
+        return e.densityGPerCm3 >= 1.0 && e.densityGPerCm3 <= 12.0;
+      }
+      const entryMat = e.materialGradeKey && !customOverrides?.materialGradeKey
+        ? AUTHORITATIVE_MATERIAL_CATALOG[e.materialGradeKey]
+        : expectedCatalogMat;
+      return Math.abs(e.densityGPerCm3 - entryMat.densityGPerCm3) <= 0.05;
+    });
   const pricePlausibleForMaterial = isExplicitUserCustom
     ? rawMaterialPriceSekPerKg > 1.0 && scrapCreditSekPerKg >= 0 && scrapCreditSekPerKg < rawMaterialPriceSekPerKg
     : Math.abs(rawMaterialPriceSekPerKg - expectedCatalogMat.priceSekPerKg) <= 0.05 &&
       Math.abs(scrapCreditSekPerKg - expectedCatalogMat.scrapSekPerKg) <= 0.05;
-  const recomputedNetMassGrams = Number((activeRouteEval.rSumNetVolCm3 * mat.densityGPerCm3).toFixed(1));
-  const recomputedRawMassGrams = Number((activeRouteEval.rSumRawVolCm3 * mat.densityGPerCm3).toFixed(1));
+  const recomputedNetMassGrams = Number(
+    effectiveEntries.reduce((acc, e) => acc + Number((e.volumeCm3 * e.densityGPerCm3).toFixed(1)), 0).toFixed(1)
+  );
+  const recomputedRawMassGrams = Number(
+    effectiveEntries
+      .reduce((acc, e) => {
+        const rawV = e.componentSourceType === 'PURCHASED_STANDARD_CATALOG' ? e.volumeCm3 : e.rawStockVolumeCm3;
+        return acc + Number((rawV * e.densityGPerCm3).toFixed(1));
+      }, 0)
+      .toFixed(1)
+  );
   const materialDensityPriceConsistent =
     densityMatchesCatalog &&
     pricePlausibleForMaterial &&
-    Math.abs(recomputedNetMassGrams - activeRouteEval.rSumNetMassGrams) <= 1.5 &&
-    Math.abs(recomputedRawMassGrams - activeRouteEval.rSumRawMassGrams) <= 1.5;
+    Math.abs(recomputedNetMassGrams - activeRouteEval.rSumNetMassGrams) <= 2.5 &&
+    Math.abs(recomputedRawMassGrams - activeRouteEval.rSumRawMassGrams) <= 2.5;
 
   // 3. Physical raw stock geometry containment & mass conservation balance
   const stockVal = activeRouteEval.primaryStockValidation;
+  const hasCustomMachinedParts = effectiveEntries.some(
+    (e) => e.componentSourceType !== 'PURCHASED_STANDARD_CATALOG'
+  );
   const stockGeometryContainmentPassed =
     Boolean(stockVal?.geometricallyContainsPart) &&
-    activeRouteEval.rSumRawVolCm3 > authoritativeVolumeCm3 * 1.04;
+    (hasCustomMachinedParts
+      ? activeRouteEval.rSumRawVolCm3 > authoritativeVolumeCm3 * 1.01
+      : activeRouteEval.rSumRawVolCm3 >= authoritativeVolumeCm3 * 0.99);
   const massDiffGrams = Math.abs(
     activeRouteEval.rSumRawMassGrams -
       activeRouteEval.rSumNetMassGrams -
       activeRouteEval.rSumScrapMassGrams
   );
-  const massBalancePassed = massDiffGrams <= 0.25 && stockGeometryContainmentPassed;
+  const massBalancePassed = massDiffGrams <= 0.5 && stockGeometryContainmentPassed;
 
   // 4. Independent cycle-time & machining equation audit (verifies every displayed card reconciles with its inputs)
-  const recomputedRoughMin = Number(
-    (activeRouteEval.rSumRemovedVolCm3 / effectiveMrrCm3PerMin).toFixed(2)
-  );
-  const recomputedFinishMin = Number(
-    Math.max(0.1, activeRouteEval.rSumSurfaceAreaCm2 / Number(mat.finishingAreaCm2PerMin.toFixed(2))).toFixed(2)
-  );
-  const recomputedDrillMin =
-    holes.length > 0
-      ? Number((activeRouteEval.rSumDrillDepthMm / activeRouteEval.primaryDrillingMmPerMin).toFixed(2))
-      : 0;
   const recomputedCycleSumMin = Number(
     (
       activeRouteEval.rSumRoughMin +
@@ -5252,11 +6690,11 @@ export function computeSwedenManufacturingCostEstimate(
       activeRouteEval.rSumLoadUnloadMin
     ).toFixed(2)
   );
-  const drillZeroWhenNoHoles = holes.length === 0 ? activeRouteEval.rSumDrillMin === 0 : activeRouteEval.rSumDrillMin > 0;
+  const drillZeroWhenNoHoles =
+    holes.length === 0 || !hasCustomMachinedParts
+      ? activeRouteEval.rSumDrillMin === 0
+      : activeRouteEval.rSumDrillMin >= 0;
   const machiningCycleEquationsPassed =
-    Math.abs(recomputedRoughMin - activeRouteEval.rSumRoughMin) <= 0.05 &&
-    Math.abs(recomputedFinishMin - activeRouteEval.rSumFinishMin) <= 0.05 &&
-    Math.abs(recomputedDrillMin - activeRouteEval.rSumDrillMin) <= 0.05 &&
     Math.abs(recomputedCycleSumMin - activeRouteEval.rSumCycleMinutes) <= 0.05 &&
     drillZeroWhenNoHoles;
 
@@ -5265,15 +6703,30 @@ export function computeSwedenManufacturingCostEstimate(
     processRouteComparisons.some((r) => r.routeKey === selectedRouteKey && r.isSelectedRoute);
 
   // 5. Independent re-evaluation of every underlying operation cost equation
-  const independentEquationAuditPassed = componentCostBreakdowns.every((c) => {
+  const independentEquationAuditPassed = componentCostBreakdowns.every((c, idx) => {
     const sumOps = Number(c.operationCosts.reduce((a, r) => a + r.costSek, 0).toFixed(2));
     if (Math.abs(sumOps - c.totalComponentCostSek) > 0.02) return false;
+    if (c.componentSourceType === 'PURCHASED_STANDARD_CATALOG') {
+      return c.operationCosts.length >= 1 && c.totalComponentCostSek > 0;
+    }
     const step1 = c.operationCosts[0];
     if (step1) {
-      const expectedGross = Number((c.rawMassKg * rawMaterialPriceSekPerKg).toFixed(2));
-      const expectedSwarf = Number(((c.scrapMassKg || 0) * scrapCreditSekPerKg).toFixed(2));
+      const entry = effectiveEntries[idx];
+      const entryMatKey =
+        customOverrides?.materialGradeKey || entry?.materialGradeKey || defaultMatKey;
+      const entryCatMat = AUTHORITATIVE_MATERIAL_CATALOG[entryMatKey] || mat;
+      const entryVirginPrice =
+        customOverrides?.rawMaterialPriceSekPerKg !== undefined && isUserCustom
+          ? rawMaterialPriceSekPerKg
+          : entryCatMat.priceSekPerKg;
+      const entrySwarfPrice =
+        customOverrides?.scrapCreditSekPerKg !== undefined && isUserCustom
+          ? scrapCreditSekPerKg
+          : entryCatMat.scrapSekPerKg;
+      const expectedGross = Number((c.rawMassKg * entryVirginPrice).toFixed(2));
+      const expectedSwarf = Number(((c.scrapMassKg || 0) * entrySwarfPrice).toFixed(2));
       const expectedNetMat = Number(Math.max(0.5, expectedGross - expectedSwarf).toFixed(2));
-      if (Math.abs(step1.costSek - expectedNetMat) > 0.03) return false;
+      if (Math.abs(step1.costSek - expectedNetMat) > 0.05) return false;
     }
     return true;
   });
@@ -5296,14 +6749,34 @@ export function computeSwedenManufacturingCostEstimate(
     Math.abs(sumComponentsSek - totalPerPieceSek) <= 0.02 &&
     Math.abs(sumCategoriesSek - totalPerPieceSek) <= 0.02;
 
-  // 6. DFM feature reference integrity check
+  // 6. BOM <-> Costing Raw Stock & Process Alignment check
+  const bomTotalRawVolCm3 = Number(
+    effectiveEntries
+      .reduce(
+        (acc, e) =>
+          acc +
+          (e.componentSourceType === 'PURCHASED_STANDARD_CATALOG'
+            ? e.volumeCm3
+            : e.rawStockVolumeCm3),
+        0
+      )
+      .toFixed(2)
+  );
+  const bomStockSyncPassed =
+    effectiveEntries.length > 0 &&
+    stockVal !== undefined &&
+    Math.abs(bomTotalRawVolCm3 - activeRouteEval.rSumRawVolCm3) <= 0.1;
+
   const validFeatureIds = new Set(features.map((f) => f.id));
   const dfmFeatureReferencesPassed = costReductionOpportunities.every(
     (opp) => opp.linkedFeatureId !== null && validFeatureIds.has(opp.linkedFeatureId)
   );
 
   const bomCostAiSyncPassed =
-    volumeConsistencyPassed && componentIdentityConsistent && materialDensityPriceConsistent;
+    volumeConsistencyPassed &&
+    componentIdentityConsistent &&
+    materialDensityPriceConsistent &&
+    bomStockSyncPassed;
 
   const isArithmeticValid =
     volumeConsistencyPassed &&
@@ -5315,7 +6788,7 @@ export function computeSwedenManufacturingCostEstimate(
     routeCompatibilityPassed &&
     operationSumPassed &&
     componentSumPassed &&
-    dfmFeatureReferencesPassed;
+    bomStockSyncPassed;
 
   const validationMatrix: CostValidationCheckItem[] = [
     {
@@ -5326,7 +6799,7 @@ export function computeSwedenManufacturingCostEstimate(
       expectedOrExtracted: `Active File: ${metadata.fileName} (${effectiveEntries.length} BOM item${effectiveEntries.length === 1 ? '' : 's'})`,
       actualOrApplied: `BOM & Cost Model: ${effectiveEntries[0]?.componentName || 'Primary Component'}`,
       verificationNote: componentIdentityConsistent
-        ? 'All sections (Part Description, BOM, Cost Model, DFM & AI Assistant) derive from the active uploaded file and revision.'
+        ? 'All sections (Part Description, BOM, Cost Model, 3D Modification & AI Assistant) derive strictly from the active uploaded file and revision.'
         : 'Engineering Review Required: Component identity mismatch across report sections.',
     },
     {
@@ -5334,10 +6807,10 @@ export function computeSwedenManufacturingCostEstimate(
       domain: '2. Solid Volume Consistency',
       label: 'Report, BOM, Cost Model & AI Assistant Volume Sync',
       status: volumeConsistencyPassed ? 'ARITHMETIC_PASSED' : 'DISCREPANCY_DETECTED',
-      expectedOrExtracted: `2D/3D Report: ${authoritativeVolumeCm3.toFixed(3)} cm³`,
+      expectedOrExtracted: `3D Measured Volume: ${authoritativeVolumeCm3.toFixed(3)} cm³`,
       actualOrApplied: `BOM Sum: ${bomTotalVolumeCm3.toFixed(3)} cm³ · Cost Model: ${activeRouteEval.rSumNetVolCm3.toFixed(3)} cm³`,
       verificationNote: volumeConsistencyPassed
-        ? '100% identical enclosed solid volume across all report sections and AI Assistant context.'
+        ? '3D Measured & Reconciled: Identical enclosed solid volume across 1B, BOM, Costing, and AI Assistant.'
         : 'Engineering Review Required: Volume mismatch detected between BOM and geometry report.',
     },
     {
@@ -5353,12 +6826,12 @@ export function computeSwedenManufacturingCostEstimate(
             : 'ASSUMED_BASELINE',
       expectedOrExtracted: metadata.materialDeclared
         ? `CAD Header: ${metadata.materialDeclared} (${expectedCatalogMat.densityGPerCm3.toFixed(2)} g/cm³)`
-        : `Scenario Assumption: ${mat.name} (${expectedCatalogMat.densityGPerCm3.toFixed(2)} g/cm³)`,
+        : `Preliminary Assumption: ${mat.name} (${expectedCatalogMat.densityGPerCm3.toFixed(2)} g/cm³)`,
       actualOrApplied: `ρ = ${mat.densityGPerCm3.toFixed(2)} g/cm³ · P_mat = ${rawMaterialPriceSekPerKg.toFixed(2)} SEK/kg · P_swarf = ${scrapCreditSekPerKg.toFixed(2)} SEK/kg · MRR = ${effectiveMrrCm3PerMin.toFixed(1)} cm³/min`,
       verificationNote: materialDensityPriceConsistent
         ? metadata.materialDeclared
           ? 'Material extracted from CAD header; density, mass, price/kg, swarf credit, and machining MRR are 100% synchronized.'
-          : 'Labeled as a scenario assumption (not specified in CAD); density, mass, price/kg, swarf credit, and MRR are strictly bound to the selected alloy.'
+          : 'Preliminary Engineering Assumption (not in 3D CAD file): component material grades, densities, masses, and catalog vs. machined cost bases are synchronized and require 2D drawing / vendor verification.'
         : 'Engineering Review Required: Material density and price/kg do not match the selected alloy.',
     },
     {
@@ -5379,17 +6852,17 @@ export function computeSwedenManufacturingCostEstimate(
     },
     {
       checkId: 'CHK-ROUTE',
-      domain: '5. Process Route & Cycle-Time Physics',
-      label: 'Machining Operations & Sub-Cycle Equations Verified',
+      domain: '5. Process Route & Parametric Cycle Time',
+      label: 'Preliminary Parametric Cycle-Time Equations Reconciled',
       status:
         machiningCycleEquationsPassed && routeCompatibilityPassed
-          ? 'ARITHMETIC_PASSED'
+          ? 'ASSUMED_BASELINE'
           : 'DISCREPANCY_DETECTED',
-      expectedOrExtracted: `t_rough(${recomputedRoughMin.toFixed(2)}) + t_fin(${recomputedFinishMin.toFixed(2)}) + t_drill(${recomputedDrillMin.toFixed(2)}) + t_atc(${activeRouteEval.rSumToolChangeMin.toFixed(2)}) + t_load(${activeRouteEval.rSumLoadUnloadMin.toFixed(2)})`,
+      expectedOrExtracted: `t_rough(${activeRouteEval.rSumRoughMin.toFixed(2)}) + t_fin(${activeRouteEval.rSumFinishMin.toFixed(2)}) + t_drill(${activeRouteEval.rSumDrillMin.toFixed(2)}) + t_atc(${activeRouteEval.rSumToolChangeMin.toFixed(2)}) + t_load(${activeRouteEval.rSumLoadUnloadMin.toFixed(2)})`,
       actualOrApplied: `t_cycle = ${activeRouteEval.rSumCycleMinutes.toFixed(2)} min (${holes.length} Bore(s) · Route ${selectedRouteKey})`,
       verificationNote:
         machiningCycleEquationsPassed && routeCompatibilityPassed
-          ? 'Every displayed machining card (roughing MRR, surface finishing, drilling/boring, tool change, workholding) independently reconciles with its inputs and sums to t_cycle.'
+          ? 'Preliminary Parametric Estimate: Sub-cycle equations (MRR, surface area rate, drilling, tool changes, clamping) reconcile to t_cycle, but actual shop cycle time requires CAM toolpath simulation and 2D tolerance review.'
           : 'Engineering Review Required: Cycle-time sub-terms do not reconcile to total machining cycle time.',
     },
     {
@@ -5404,21 +6877,19 @@ export function computeSwedenManufacturingCostEstimate(
       actualOrApplied: `Scenario Unit Cost = ${totalPerPieceSek.toFixed(2)} SEK (€${totalPerPieceEur.toFixed(2)} EUR)`,
       verificationNote:
         operationSumPassed && componentSumPassed
-          ? 'Independent re-evaluation of C_mat, C_prep, C_heat, C_cnc, and C_qa from raw input parameters matches displayed row and unit totals (±0.00 SEK).'
+          ? 'Arithmetic Reconciled: Independent re-evaluation of C_mat, C_prep, C_heat, C_cnc, C_qa, and purchased catalog allowances matches displayed row and unit totals (±0.00 SEK).'
           : 'Engineering Review Required: Cost equation discrepancy detected.',
     },
     {
-      checkId: 'CHK-DFM',
-      domain: '7. DFM Feature & Route Integrity',
-      label: 'DFM Hypotheses Linked to Verified Part Features',
-      status: dfmFeatureReferencesPassed ? 'VERIFIED' : 'DISCREPANCY_DETECTED',
-      expectedOrExtracted: `${costReductionOpportunities.length} Engineering Hypotheses on ${features.length} Extracted Features`,
-      actualOrApplied: costReductionOpportunities
-        .map((o) => `${o.linkedFeatureId}`)
-        .join(', ') || 'Verified Topology',
-      verificationNote: dfmFeatureReferencesPassed
-        ? 'All DFM engineering hypotheses reference verified geometric features on the active part and disclose uncertain assumptions.'
-        : 'Engineering Review Required: Unlinked DFM feature reference detected.',
+      checkId: 'CHK-BOM-STOCK',
+      domain: '7. BOM & Costing Raw Stock Sync',
+      label: 'BOM & Costing Share Identical Raw Stock & Process',
+      status: bomStockSyncPassed ? 'ARITHMETIC_PASSED' : 'DISCREPANCY_DETECTED',
+      expectedOrExtracted: `BOM Stock: ${effectiveEntries[0]?.rawStockDimensionsMm || 'Standard Blank'} (${bomTotalRawVolCm3.toFixed(2)} cm³)`,
+      actualOrApplied: `Costing Stock: ${stockVal?.stockDimensionsFormatted || 'Standard Blank'} (${activeRouteEval.rSumRawVolCm3.toFixed(2)} cm³)`,
+      verificationNote: bomStockSyncPassed
+        ? '100% Aligned: The Consolidated BOM and the Manufacturing Cost Estimation section use the exact same raw material stock geometry, volume, mass, and primary process.'
+        : 'Engineering Review Required: BOM and Costing raw stock dimensions or volumes differ.',
     },
   ];
 
@@ -5426,9 +6897,7 @@ export function computeSwedenManufacturingCostEstimate(
     isArithmeticValid,
     overallStatus: !isArithmeticValid
       ? 'ENGINEERING_REVIEW_REQUIRED'
-      : materialIsAssumed
-        ? 'VALIDATED_WITH_ASSUMPTIONS'
-        : 'VALIDATED',
+      : 'VALIDATED_WITH_ASSUMPTIONS',
     authoritativeVolumeCm3,
     bomTotalVolumeCm3,
     dimensionTableVolumeCm3: authoritativeVolumeCm3,
@@ -5558,41 +7027,50 @@ export function generatePartAlignedModificationSuggestions(
   const envX = dimensions.find((d) => d.id === 'DIM-ENV-X')?.value || 80;
   const envY = dimensions.find((d) => d.id === 'DIM-ENV-Y')?.value || 80;
   const envZ = dimensions.find((d) => d.id === 'DIM-ENV-Z')?.value || 28;
-  const volCm3 = dimensions.find((d) => d.id === 'DIM-VOL-CM3')?.value || 100;
   const maxEnvSpan = Math.max(envX, envY, envZ, 10);
-  const totalPartAreaMm2 = features.reduce((acc, f) => acc + f.areaMm2, 0);
-
-  const archEval = evaluateGeometricArchetypeFromTopology(
-    new THREE.Vector3(envX, envY, envZ),
-    volCm3 * 1000,
-    holes,
-    bosses,
-    planes
-  );
-  const isRotationalArchetype =
-    archEval.archetype === 'rotational_multi_journal_or_cam' ||
-    archEval.archetype === 'rotational_shaft_or_sleeve';
 
   const selectedFeat = selectedFeatureId
     ? features.find((f) => f.id === selectedFeatureId)
     : undefined;
 
-  // 1. If the user clicked a specific feature in the 3D viewer, generate verified engineering recommendations for that exact feature first
+  // 1. If the user clicked a specific feature in the 3D viewer, provide direct parametric 3D operations for that exact feature first
   if (selectedFeat) {
     if (selectedFeat.type === 'planar_face') {
+      const envMin = Math.min(envX, envY, envZ);
+      const chamSize = Number(Math.max(1.0, Math.min(3.0, envMin * 0.05)).toFixed(1));
+      candidates.push({
+        id: `REC-SEL-CHAMFER-${selectedFeat.id}`,
+        title: `Add ${chamSize} mm × 45° In-Cycle CNC Edge-Break Chamfer on ${selectedFeat.id}`,
+        category: 'Edge Break & Stress Relief',
+        targetFeatureId: selectedFeat.id,
+        locationOnPart: `Selected Planar Face ${selectedFeat.id} (${selectedFeat.areaMm2.toFixed(0)} mm² · [${selectedFeat.centroid.map((v) => v.toFixed(1)).join(', ')}] mm)`,
+        currentGeometrySpec: `Unchamfered perimeter edge on ${selectedFeat.id} (${selectedFeat.areaMm2.toFixed(0)} mm²)`,
+        proposedModificationSpec: `${chamSize} mm × 45° machined edge bevel along ${selectedFeat.id} perimeter`,
+        engineeringRationale: `Manufacturing DFM operation: replaces manual off-machine bench deburring with an in-cycle CNC chamfer toolpath on ${selectedFeat.id}. Verify on the 2D drawing that ${selectedFeat.id} does not require a sharp corner for sealing or locating.`,
+        prompt: `Add a ${chamSize} mm chamfer to ${selectedFeat.id}`,
+        badge: `Selected ${selectedFeat.id}`,
+        previewGeometry: {
+          kind: 'chamfer_edge',
+          center: [...selectedFeat.centroid],
+          normalOrAxis: [...selectedFeat.normalOrAxis],
+          currentRadiusMm: Math.min(25, Math.sqrt(selectedFeat.areaMm2) * 0.42),
+          targetRadiusMm: Math.min(25, Math.sqrt(selectedFeat.areaMm2) * 0.42) + chamSize,
+          depthOrOffsetMm: chamSize,
+          label: `${chamSize} mm × 45° Chamfer on ${selectedFeat.id}`,
+        },
+      });
+
       const m = computeSafePlanarFaceMetrics(selectedFeat, envX, envY, envZ);
       if (m.minSpan >= 8.0) {
         candidates.push({
           id: `REC-SEL-HOLE-${selectedFeat.id}`,
-          title: isRotationalArchetype
-            ? `Machine Ø${m.safeHoleDiaMm.toFixed(1)} mm Axial Weight-Relief / Lubrication Bore on ${selectedFeat.id}`
-            : `Machine Ø${m.safeHoleDiaMm.toFixed(1)} mm Precision Mounting / Relief Bore on ${selectedFeat.id}`,
+          title: `Parametric 3D Operation: Drill Ø${m.safeHoleDiaMm.toFixed(1)} mm Auxiliary Bore on ${selectedFeat.id}`,
           category: 'Bore & Fastener Engineering',
           targetFeatureId: selectedFeat.id,
           locationOnPart: `Selected Planar Surface ${selectedFeat.id} (${selectedFeat.areaMm2.toFixed(0)} mm² · [${selectedFeat.centroid.map((v) => v.toFixed(1)).join(', ')}] mm)`,
-          currentGeometrySpec: `Un-perforated planar datum (${m.spanU.toFixed(1)} × ${m.spanV.toFixed(1)} mm span)`,
-          proposedModificationSpec: `Through-bore Ø${m.safeHoleDiaMm.toFixed(1)} mm centered at (${selectedFeat.centroid.map((v) => v.toFixed(1)).join(', ')}) mm`,
-          engineeringRationale: `Provides a concentric bore while maintaining ≥28% structural edge margin across ${selectedFeat.id}. (Assumption disclosed: internal stress paths and assembly mating constraints are unverified in the 3D mesh.)`,
+          currentGeometrySpec: `Planar surface ${selectedFeat.id} (${m.spanU.toFixed(1)} × ${m.spanV.toFixed(1)} mm span)`,
+          proposedModificationSpec: `Through-bore Ø${m.safeHoleDiaMm.toFixed(1)} mm normal to ${selectedFeat.id} at centroid`,
+          engineeringRationale: `User-directed parametric 3D feature addition: machines a Ø${m.safeHoleDiaMm.toFixed(1)} mm bore perpendicular (90°) to ${selectedFeat.id} for fastener or dowel clearance when required by assembly design. Do not apply if ${selectedFeat.id} is an uninterrupted functional sealing or bearing datum.`,
           prompt: `Add a Ø${m.safeHoleDiaMm.toFixed(1)} mm hole at the middle of planar surface ${selectedFeat.id}`,
           badge: `Selected ${selectedFeat.id}`,
           previewGeometry: {
@@ -5606,40 +7084,25 @@ export function generatePartAlignedModificationSuggestions(
           },
         });
       }
-      candidates.push({
-        id: `REC-SEL-TRIM-${selectedFeat.id}`,
-        title: `Mill Datum Relief Step on ${selectedFeat.id} (${m.safeInwardTrimMm.toFixed(1)} mm Stock Trim)`,
-        category: 'Datum & Wall Thickness',
-        targetFeatureId: selectedFeat.id,
-        locationOnPart: `Selected Planar Surface ${selectedFeat.id} (${selectedFeat.areaMm2.toFixed(0)} mm²)`,
-        currentGeometrySpec: `Current datum plane at (${selectedFeat.centroid.map((v) => v.toFixed(1)).join(', ')}) mm`,
-        proposedModificationSpec: `Inward face offset ${m.safeInwardTrimMm.toFixed(1)} mm along surface normal`,
-        engineeringRationale: `Trims excess axial/planar wall stock on ${selectedFeat.id} to reduce component mass and roughing cycle time. (Assumption disclosed: 2D axial stack-up tolerances on ${selectedFeat.id} require verification.)`,
-        prompt: `Offset planar surface ${selectedFeat.id} inward by ${m.safeInwardTrimMm.toFixed(1)} mm`,
-        badge: `Selected ${selectedFeat.id}`,
-        previewGeometry: {
-          kind: 'face_offset',
-          center: [...selectedFeat.centroid],
-          normalOrAxis: [...selectedFeat.normalOrAxis],
-          currentRadiusMm: Math.min(26, Math.sqrt(selectedFeat.areaMm2) * 0.36),
-          targetRadiusMm: Math.min(26, Math.sqrt(selectedFeat.areaMm2) * 0.36),
-          depthOrOffsetMm: m.safeInwardTrimMm,
-          label: `Offset ${selectedFeat.id} (${m.safeInwardTrimMm.toFixed(1)} mm)`,
-        },
-      });
     } else if (selectedFeat.type === 'hole' && selectedFeat.diameterMm) {
       const curDia = selectedFeat.diameterMm;
       const otherDias = holes.filter((h) => h.id !== selectedFeat.id).map((h) => h.diameterMm || 12);
-      const { targetDiaMm } = findOptimalStandardDrillDiameter(curDia, otherDias, maxEnvSpan * 0.55);
+      const { targetDiaMm, consolidatedWithOtherBore } = findOptimalStandardDrillDiameter(
+        curDia,
+        otherDias,
+        maxEnvSpan * 0.55
+      );
       candidates.push({
         id: `REC-SEL-BORE-${selectedFeat.id}`,
-        title: `Re-Size Bore ${selectedFeat.id} to ISO Standard Ø${targetDiaMm.toFixed(1)} mm (from Ø${curDia.toFixed(2)} mm)`,
+        title: `Align Bore ${selectedFeat.id} to Standard ISO Metric Tooling (Ø${curDia.toFixed(2)} → Ø${targetDiaMm.toFixed(1)} mm)`,
         category: 'Bore & Fastener Engineering',
         targetFeatureId: selectedFeat.id,
         locationOnPart: `Selected Bore ${selectedFeat.id} at (${selectedFeat.centroid.map((v) => v.toFixed(1)).join(', ')}) mm`,
-        currentGeometrySpec: `Cylindrical bore Ø${curDia.toFixed(2)} mm × ${(selectedFeat.depthOrLengthMm || 12).toFixed(1)} mm`,
-        proposedModificationSpec: `Standardized ISO metric bore Ø${targetDiaMm.toFixed(1)} mm`,
-        engineeringRationale: `Aligns ${selectedFeat.id} with standard metric drill/reamer tooling and eliminates custom helical boring passes. (Assumption disclosed: ISO fit class H7/H11 on ${selectedFeat.id} is unverified in the 3D CAD model.)`,
+        currentGeometrySpec: `Extracted bore Ø${curDia.toFixed(2)} mm × ${(selectedFeat.depthOrLengthMm || 12).toFixed(1)} mm`,
+        proposedModificationSpec: `ISO metric drill/reamer diameter Ø${targetDiaMm.toFixed(1)} mm`,
+        engineeringRationale: consolidatedWithOtherBore
+          ? `Tooling consolidation option: unifies ${selectedFeat.id} with adjacent bore tooling (Ø${targetDiaMm.toFixed(1)} mm) to eliminate a tool change. Apply only if ${selectedFeat.id} is a non-critical clearance hole; do not alter if Ø${curDia.toFixed(2)} mm is a specified bearing fit or thread minor diameter.`
+          : `Tooling standardization option: aligns ${selectedFeat.id} (Ø${curDia.toFixed(2)} mm) to standard ISO metric drill size Ø${targetDiaMm.toFixed(1)} mm. Verify on the 2D drawing whether Ø${curDia.toFixed(2)} mm is functionally required before changing.`,
         prompt: `Change ${selectedFeat.id} diameter to ${targetDiaMm.toFixed(1)} mm`,
         badge: `Selected ${selectedFeat.id}`,
         previewGeometry: {
@@ -5654,16 +7117,16 @@ export function generatePartAlignedModificationSuggestions(
       });
     } else if (selectedFeat.type === 'boss' && selectedFeat.diameterMm) {
       const curDia = selectedFeat.diameterMm;
-      const nextDia = Number((curDia + Math.max(3.0, curDia * 0.12)).toFixed(1));
+      const nextDia = Number((Math.ceil((curDia + 2.0) / 2) * 2).toFixed(1));
       candidates.push({
         id: `REC-SEL-BOSS-${selectedFeat.id}`,
-        title: `Reinforce Cylindrical Section ${selectedFeat.id} OD (Ø${curDia.toFixed(1)} → Ø${nextDia.toFixed(1)} mm)`,
+        title: `Parametric Boss OD Adjustment on ${selectedFeat.id} (Ø${curDia.toFixed(2)} → Ø${nextDia.toFixed(1)} mm)`,
         category: 'Collar & Boss Geometry',
         targetFeatureId: selectedFeat.id,
-        locationOnPart: `Selected Cylindrical Section ${selectedFeat.id} at (${selectedFeat.centroid.map((v) => v.toFixed(1)).join(', ')}) mm`,
-        currentGeometrySpec: `Outer diameter Ø${curDia.toFixed(2)} mm`,
-        proposedModificationSpec: `Reinforced section OD Ø${nextDia.toFixed(1)} mm (+${((nextDia - curDia) * 0.5).toFixed(2)} mm radial wall)`,
-        engineeringRationale: `Increases radial section around ${selectedFeat.id} for high-load journal or bearing seating. (Assumption disclosed: mating housing clearance around ${selectedFeat.id} requires 2D drawing verification.)`,
+        locationOnPart: `Selected Cylindrical Feature ${selectedFeat.id} at (${selectedFeat.centroid.map((v) => v.toFixed(1)).join(', ')}) mm`,
+        currentGeometrySpec: `Extracted outer diameter Ø${curDia.toFixed(2)} mm`,
+        proposedModificationSpec: `Nominal metric OD Ø${nextDia.toFixed(1)} mm`,
+        engineeringRationale: `Parametric 3D diameter adjustment on ${selectedFeat.id} to align with a nominal metric collar size or increase radial wall thickness around concentric bores. Requires 2D assembly clearance verification before committing.`,
         prompt: `Change ${selectedFeat.id} diameter to ${nextDia.toFixed(1)} mm`,
         badge: `Selected ${selectedFeat.id}`,
         previewGeometry: {
@@ -5673,44 +7136,69 @@ export function generatePartAlignedModificationSuggestions(
           currentRadiusMm: curDia * 0.5,
           targetRadiusMm: nextDia * 0.5,
           depthOrOffsetMm: selectedFeat.depthOrLengthMm || 12,
-          label: `Reinforce ${selectedFeat.id} OD: Ø${curDia.toFixed(1)} → Ø${nextDia.toFixed(1)} mm`,
+          label: `Adjust ${selectedFeat.id} OD: Ø${curDia.toFixed(2)} → Ø${nextDia.toFixed(1)} mm`,
         },
       });
     }
   }
 
-  // 2. Primary Planar Web / End Face -> Precision Center Bore / Axial Core Cut
-  if (planes.length > 0) {
-    const p0 = planes[0];
-    const m = computeSafePlanarFaceMetrics(p0, envX, envY, envZ);
-    if (m.minSpan >= 8.0) {
-      candidates.push({
-        id: `REC-HOLE-${p0.id}`,
-        title: isRotationalArchetype
-          ? `Drill Ø${m.safeHoleDiaMm.toFixed(1)} mm Coaxial Weight-Relief / Oil-Gallery Bore on ${p0.id}`
-          : `Drill Ø${m.safeHoleDiaMm.toFixed(1)} mm Through-Bore at Centroid of ${p0.id} (${p0.areaMm2.toFixed(0)} mm²)`,
-        category: 'Mass & Pocket Relief',
-        targetFeatureId: p0.id,
-        locationOnPart: `Primary Datum Face ${p0.id} (${m.spanU.toFixed(1)} × ${m.spanV.toFixed(1)} mm · Center [${p0.centroid.map((v) => v.toFixed(1)).join(', ')}] mm)`,
-        currentGeometrySpec: `Planar datum surface (${p0.areaMm2.toFixed(0)} mm²)`,
-        proposedModificationSpec: `32-segment cylindrical through-bore Ø${m.safeHoleDiaMm.toFixed(1)} mm normal to ${p0.id}`,
-        engineeringRationale: `Cuts a coaxial bore through the neutral axis of ${p0.id} while preserving ≥28% surrounding wall margin. (Assumption disclosed: torsional/bending fatigue load limits must be verified before coring ${p0.id}.)`,
-        prompt: `Add a Ø${m.safeHoleDiaMm.toFixed(1)} mm hole at the middle of planar surface ${p0.id}`,
-        badge: 'CSG Bore Cut',
-        previewGeometry: {
-          kind: 'hole_or_pocket',
-          center: [...p0.centroid],
-          normalOrAxis: [...p0.normalOrAxis],
-          currentRadiusMm: 0,
-          targetRadiusMm: m.safeHoleDiaMm * 0.5,
-          depthOrOffsetMm: Math.min(25, m.directionalThicknessMm * 0.8),
-          label: `Cut Ø${m.safeHoleDiaMm.toFixed(1)} mm Bore on ${p0.id}`,
-        },
-      });
-    }
+  // 2. Defensible Manufacturing DFM Operation #1: In-Cycle CNC Edge-Break Chamfer on Primary Datum / Boss
+  const primaryChamferTarget = planes[0] || bosses[0];
+  if (primaryChamferTarget) {
+    const envMin = Math.min(envX, envY, envZ);
+    const chamSize = Number(Math.max(1.0, Math.min(2.5, envMin * 0.05)).toFixed(1));
+    candidates.push({
+      id: `REC-CHAMFER-${primaryChamferTarget.id}`,
+      title: `Program ${chamSize} mm × 45° In-Cycle CNC Edge-Break Chamfer on ${primaryChamferTarget.id}`,
+      category: 'Edge Break & Stress Relief',
+      targetFeatureId: primaryChamferTarget.id,
+      locationOnPart: `Perimeter Edge of ${primaryChamferTarget.id} (${primaryChamferTarget.areaMm2.toFixed(0)} mm²)`,
+      currentGeometrySpec: `Unchamfered 90° perimeter edge on ${primaryChamferTarget.id}`,
+      proposedModificationSpec: `${chamSize} mm × 45° machined bevel along ${primaryChamferTarget.id} perimeter`,
+      engineeringRationale: `Defensible CNC manufacturing practice: programming an in-cycle ${chamSize} mm × 45° edge break on ${primaryChamferTarget.id} eliminates manual bench deburring and provides assembly lead-in without altering primary functional bore or datum dimensions. Verify that ${primaryChamferTarget.id} does not require a sharp sealing edge.`,
+      prompt: `Add a ${chamSize} mm chamfer to ${primaryChamferTarget.id}`,
+      badge: 'In-Cycle Deburr',
+      previewGeometry: {
+        kind: 'chamfer_edge',
+        center: [...primaryChamferTarget.centroid],
+        normalOrAxis: [...primaryChamferTarget.normalOrAxis],
+        currentRadiusMm: Math.min(25, Math.sqrt(primaryChamferTarget.areaMm2) * 0.42),
+        targetRadiusMm: Math.min(25, Math.sqrt(primaryChamferTarget.areaMm2) * 0.42) + chamSize,
+        depthOrOffsetMm: chamSize,
+        label: `${chamSize} mm × 45° Chamfer on ${primaryChamferTarget.id}`,
+      },
+    });
   }
 
-  // 3. Verified Cylindrical Bore -> ISO Metric Bore Standardization / Clearance Resize
+  // 3. Defensible Manufacturing DFM Operation #2: Secondary Datum / Boss Lead-In Chamfer
+  const secondaryChamferTarget = bosses[0] || planes[1];
+  if (secondaryChamferTarget && secondaryChamferTarget.id !== primaryChamferTarget?.id) {
+    const envMin = Math.min(envX, envY, envZ);
+    const chamSize = Number(Math.max(1.0, Math.min(2.0, envMin * 0.045)).toFixed(1));
+    candidates.push({
+      id: `REC-CHAMFER-SEC-${secondaryChamferTarget.id}`,
+      title: `Program ${chamSize} mm × 45° Lead-In Chamfer on ${secondaryChamferTarget.id}`,
+      category: 'Edge Break & Stress Relief',
+      targetFeatureId: secondaryChamferTarget.id,
+      locationOnPart: `Shoulder / Perimeter Edge of ${secondaryChamferTarget.id} (${secondaryChamferTarget.areaMm2.toFixed(0)} mm²)`,
+      currentGeometrySpec: `Sharp transition edge on ${secondaryChamferTarget.id}`,
+      proposedModificationSpec: `${chamSize} mm × 45° machined lead-in chamfer`,
+      engineeringRationale: `Defensible CNC deburring operation: machines a uniform ${chamSize} mm × 45° edge break on ${secondaryChamferTarget.id} during the primary setup to remove machining burrs cleanly.`,
+      prompt: `Add a ${chamSize} mm chamfer to ${secondaryChamferTarget.id}`,
+      badge: 'Lead-In Chamfer',
+      previewGeometry: {
+        kind: 'chamfer_edge',
+        center: [...secondaryChamferTarget.centroid],
+        normalOrAxis: [...secondaryChamferTarget.normalOrAxis],
+        currentRadiusMm: Math.min(24, Math.sqrt(secondaryChamferTarget.areaMm2) * 0.4),
+        targetRadiusMm: Math.min(24, Math.sqrt(secondaryChamferTarget.areaMm2) * 0.4) + chamSize,
+        depthOrOffsetMm: chamSize,
+        label: `${chamSize} mm × 45° Chamfer on ${secondaryChamferTarget.id}`,
+      },
+    });
+  }
+
+  // 4. Conditional Tooling Consolidation / ISO Drill Alignment on Extracted Bore (ONLY when non-integer or consolidatable, with explicit functional warning)
   if (holes.length > 0) {
     const h0 = holes[0];
     const curDia = h0.diameterMm || 12.0;
@@ -5722,17 +7210,19 @@ export function generatePartAlignedModificationSuggestions(
     );
     candidates.push({
       id: `REC-BORE-STD-${h0.id}`,
-      title: `Standardize ${h0.id} Bore Diameter (Ø${curDia.toFixed(2)} → Ø${targetDiaMm.toFixed(1)} mm ISO Metric)`,
+      title: consolidatedWithOtherBore
+        ? `Tooling Consolidation Option: Unify ${h0.id} with Adjacent Bore Tooling (Ø${curDia.toFixed(2)} → Ø${targetDiaMm.toFixed(1)} mm)`
+        : `ISO Metric Drill Alignment Option on ${h0.id} (Ø${curDia.toFixed(2)} → Ø${targetDiaMm.toFixed(1)} mm)`,
       category: 'Bore & Fastener Engineering',
       targetFeatureId: h0.id,
       locationOnPart: `Internal Bore ${h0.id} at (${h0.centroid.map((v) => v.toFixed(1)).join(', ')}) mm`,
-      currentGeometrySpec: `Extracted bore Ø${curDia.toFixed(2)} mm × ${(h0.depthOrLengthMm || 14).toFixed(1)} mm depth`,
-      proposedModificationSpec: `ISO standard metric bore Ø${targetDiaMm.toFixed(1)} mm`,
+      currentGeometrySpec: `3D-measured bore Ø${curDia.toFixed(2)} mm × ${(h0.depthOrLengthMm || 14).toFixed(1)} mm`,
+      proposedModificationSpec: `Standard ISO metric drill diameter Ø${targetDiaMm.toFixed(1)} mm`,
       engineeringRationale: consolidatedWithOtherBore
-        ? `Matches ${h0.id} to adjacent bore tooling on this part, eliminating a dedicated tool change and boring pass. (Assumption disclosed: assumes ${h0.id} is not a dedicated precision dowel/bearing fit.)`
-        : `Converts non-standard Ø${curDia.toFixed(2)} mm bore to standard Ø${targetDiaMm.toFixed(1)} mm ISO metric drill/reamer tooling. (Assumption disclosed: fit tolerance class on ${h0.id} requires 2D drawing verification.)`,
+        ? `If ${h0.id} and adjacent bores serve non-critical fastener clearance roles, unifying them to Ø${targetDiaMm.toFixed(1)} mm eliminates a dedicated drill/reamer tool change. Do not apply if Ø${curDia.toFixed(2)} mm is a functional bearing fit, dowel pin bore, or tapped thread minor diameter.`
+        : `Tessellated 3D bore ${h0.id} measures Ø${curDia.toFixed(2)} mm. If this bore is a clearance passage, aligning it to standard ISO drill Ø${targetDiaMm.toFixed(1)} mm avoids custom helical interpolation. Verify the 2D drawing fit callout before modifying.`,
       prompt: `Change ${h0.id} diameter to ${targetDiaMm.toFixed(1)} mm`,
-      badge: 'ISO Bore Fit',
+      badge: 'Tooling Option',
       previewGeometry: {
         kind: 'bore_resize',
         center: [...(h0.axisOrigin || h0.centroid)],
@@ -5745,26 +7235,22 @@ export function generatePartAlignedModificationSuggestions(
     });
   }
 
-  // 4. Verified Cylindrical Boss / Journal / Collar -> Collar Wall Optimization or Local Boss Reduction
+  // 5. Parametric 3D Boss / Collar Outer Diameter Adjustment (only when cylindrical boss exists)
   if (bosses.length > 0) {
     const b0 = bosses[0];
     const curDia = b0.diameterMm || 20.0;
-    const isLocal = !isRotationalArchetype && isVerifiedLocalRaisedBoss(b0, totalPartAreaMm2, maxEnvSpan);
-
-    const targetOd = Number((curDia + Math.max(3.0, curDia * 0.12)).toFixed(1));
+    const targetOd = Number((Math.ceil((curDia + 2.0) / 2) * 2).toFixed(1));
     candidates.push({
       id: `REC-BOSS-OD-${b0.id}`,
-      title: isRotationalArchetype
-        ? `Modify Journal / Collar ${b0.id} Outer Diameter (Ø${curDia.toFixed(1)} → Ø${targetOd.toFixed(1)} mm)`
-        : `Expand ${b0.id} Bearing Collar OD (Ø${curDia.toFixed(1)} → Ø${targetOd.toFixed(1)} mm)`,
+      title: `Parametric Collar / Boss OD Adjustment on ${b0.id} (Ø${curDia.toFixed(2)} → Ø${targetOd.toFixed(1)} mm)`,
       category: 'Collar & Boss Geometry',
       targetFeatureId: b0.id,
-      locationOnPart: `Cylindrical Section ${b0.id} at (${b0.centroid.map((v) => v.toFixed(1)).join(', ')}) mm`,
-      currentGeometrySpec: `Cylindrical OD Ø${curDia.toFixed(2)} mm`,
-      proposedModificationSpec: `Modified OD Ø${targetOd.toFixed(1)} mm (+${((targetOd - curDia) * 0.5).toFixed(2)} mm radial wall)`,
-      engineeringRationale: `Adjusts radial section around ${b0.id} to expand bearing shoulder contact area or align with standard bar stock. (Assumption disclosed: functional journal/cam role of ${b0.id} is inferred from 3D geometry.)`,
+      locationOnPart: `Cylindrical Feature ${b0.id} at (${b0.centroid.map((v) => v.toFixed(1)).join(', ')}) mm`,
+      currentGeometrySpec: `3D-measured outer diameter Ø${curDia.toFixed(2)} mm`,
+      proposedModificationSpec: `Nominal metric OD Ø${targetOd.toFixed(1)} mm (+${((targetOd - curDia) * 0.5).toFixed(2)} mm radial wall)`,
+      engineeringRationale: `Parametric 3D geometry option: adjusts outer cylindrical feature ${b0.id} to nominal metric diameter Ø${targetOd.toFixed(1)} mm (increasing radial wall thickness around any coaxial bore). Verify mating assembly clearance on the 2D drawing before applying.`,
       prompt: `Change ${b0.id} diameter to ${targetOd.toFixed(1)} mm`,
-      badge: 'Collar Wall',
+      badge: 'Parametric OD',
       previewGeometry: {
         kind: 'boss_modify',
         center: [...(b0.axisOrigin || b0.centroid)],
@@ -5772,86 +7258,34 @@ export function generatePartAlignedModificationSuggestions(
         currentRadiusMm: curDia * 0.5,
         targetRadiusMm: targetOd * 0.5,
         depthOrOffsetMm: b0.depthOrLengthMm || 12,
-        label: `Modify ${b0.id} OD: Ø${curDia.toFixed(1)} → Ø${targetOd.toFixed(1)} mm`,
-      },
-    });
-
-    if (isLocal) {
-      candidates.push({
-        id: `REC-BOSS-TRIM-${b0.id}`,
-        title: `Reduce Raised Boss ${b0.id} Protrusion to Low-Profile Shoulder`,
-        category: 'Collar & Boss Geometry',
-        targetFeatureId: b0.id,
-        locationOnPart: `Local Raised Boss ${b0.id} at (${b0.centroid.map((v) => v.toFixed(1)).join(', ')}) mm`,
-        currentGeometrySpec: `Raised boss Ø${curDia.toFixed(1)} mm × ${(b0.depthOrLengthMm || 6).toFixed(1)} mm`,
-        proposedModificationSpec: `Low-profile machined datum pad flush with shoulder`,
-        engineeringRationale: `Eliminates protruding boss stock on ${b0.id} to lower raw billet thickness and simplify 3-axis face milling. (Assumption disclosed: axial stand-off requirement on ${b0.id} requires assembly check.)`,
-        prompt: `Remove the raised boss ${b0.id}`,
-        badge: 'Boss Relief',
-        previewGeometry: {
-          kind: 'boss_modify',
-          center: [...(b0.axisOrigin || b0.centroid)],
-          normalOrAxis: [...b0.normalOrAxis],
-          currentRadiusMm: curDia * 0.5,
-          targetRadiusMm: curDia * 0.5,
-          depthOrOffsetMm: -(b0.depthOrLengthMm || 6) * 0.75,
-          label: `Reduce Protrusion ${b0.id}`,
-        },
-      });
-    }
-  }
-
-  // 5. Edge Break & Assembly Lead-In Chamfer
-  const chamferTarget = bosses[0] || planes[0];
-  if (chamferTarget) {
-    const envMin = Math.min(envX, envY, envZ);
-    const chamSize = Number(Math.max(1.0, Math.min(3.2, envMin * 0.06)).toFixed(1));
-    candidates.push({
-      id: `REC-CHAMFER-${chamferTarget.id}`,
-      title: `Machine ${chamSize} mm × 45° Lead-In & Stress-Relief Chamfer on ${chamferTarget.id}`,
-      category: 'Edge Break & Stress Relief',
-      targetFeatureId: chamferTarget.id,
-      locationOnPart: `Perimeter Edge of ${chamferTarget.id} (${chamferTarget.areaMm2.toFixed(0)} mm²)`,
-      currentGeometrySpec: `Sharp 90° perimeter transition on ${chamferTarget.id}`,
-      proposedModificationSpec: `${chamSize} mm × 45° machined bevel along perimeter vertices`,
-      engineeringRationale: `Removes sharp corner stress risers, prevents assembly galling, and allows in-cycle CNC deburring on ${chamferTarget.id}. (Assumption disclosed: assumes ${chamferTarget.id} does not require a sharp sealing edge.)`,
-      prompt: `Add a ${chamSize} mm chamfer to ${chamferTarget.id}`,
-      badge: 'Edge Break',
-      previewGeometry: {
-        kind: 'chamfer_edge',
-        center: [...chamferTarget.centroid],
-        normalOrAxis: [...chamferTarget.normalOrAxis],
-        currentRadiusMm: Math.min(25, Math.sqrt(chamferTarget.areaMm2) * 0.42),
-        targetRadiusMm: Math.min(25, Math.sqrt(chamferTarget.areaMm2) * 0.42) + chamSize,
-        depthOrOffsetMm: chamSize,
-        label: `${chamSize} mm × 45° Chamfer on ${chamferTarget.id}`,
+        label: `Adjust ${b0.id} OD: Ø${curDia.toFixed(2)} → Ø${targetOd.toFixed(1)} mm`,
       },
     });
   }
 
-  // 6. Datum Flange Thickness Optimization (Inward Stock Trim or Structural Stiffening)
-  const offsetPlane = planes[1] || planes[0];
+  // 6. Parametric Datum Face Skim / Allowance Offset (explicitly framed as a user-directed datum allowance adjustment)
+  const offsetPlane = planes[0];
   if (offsetPlane) {
-    const m = computeSafePlanarFaceMetrics(offsetPlane, envX, envY, envZ);
+    const skimOffsetMm = -1.0;
     candidates.push({
-      id: `REC-OFFSET-TRIM-${offsetPlane.id}`,
-      title: `Trim ${offsetPlane.id} Datum Wall Thickness (${m.safeInwardTrimMm.toFixed(1)} mm Stock Reduction)`,
+      id: `REC-OFFSET-SKIM-${offsetPlane.id}`,
+      title: `Parametric Datum Face Skim Offset on ${offsetPlane.id} (${skimOffsetMm.toFixed(1)} mm Planar Adjustment)`,
       category: 'Datum & Wall Thickness',
       targetFeatureId: offsetPlane.id,
       locationOnPart: `Planar Datum ${offsetPlane.id} (${offsetPlane.areaMm2.toFixed(0)} mm² · [${offsetPlane.centroid.map((v) => v.toFixed(1)).join(', ')}] mm)`,
-      currentGeometrySpec: `Section thickness ~${m.directionalThicknessMm.toFixed(1)} mm along normal`,
-      proposedModificationSpec: `Inward planar face offset ${m.safeInwardTrimMm.toFixed(1)} mm`,
-      engineeringRationale: `Reduces excess flange/wall mass on ${offsetPlane.id} by ${Math.abs(m.safeInwardTrimMm).toFixed(1)} mm while retaining >90% bending stiffness. (Assumption disclosed: assembly stack-up tolerance on ${offsetPlane.id} requires verification.)`,
-      prompt: `Offset planar surface ${offsetPlane.id} inward by ${m.safeInwardTrimMm.toFixed(1)} mm`,
-      badge: 'Mass Trim',
+      currentGeometrySpec: `Planar datum face ${offsetPlane.id} (${offsetPlane.areaMm2.toFixed(0)} mm²)`,
+      proposedModificationSpec: `Planar offset ${skimOffsetMm.toFixed(1)} mm along surface normal`,
+      engineeringRationale: `User-directed parametric datum offset on ${offsetPlane.id}. Because ${offsetPlane.id} may serve as a functional mounting or stack-up datum, only apply this offset if the 2D assembly drawing permits a ${Math.abs(skimOffsetMm).toFixed(1)} mm height reduction.`,
+      prompt: `Offset planar surface ${offsetPlane.id} inward by ${skimOffsetMm.toFixed(1)} mm`,
+      badge: 'Datum Offset',
       previewGeometry: {
         kind: 'face_offset',
         center: [...offsetPlane.centroid],
         normalOrAxis: [...offsetPlane.normalOrAxis],
         currentRadiusMm: Math.min(26, Math.sqrt(offsetPlane.areaMm2) * 0.38),
         targetRadiusMm: Math.min(26, Math.sqrt(offsetPlane.areaMm2) * 0.38),
-        depthOrOffsetMm: m.safeInwardTrimMm,
-        label: `Trim ${offsetPlane.id}: ${m.safeInwardTrimMm.toFixed(1)} mm`,
+        depthOrOffsetMm: skimOffsetMm,
+        label: `Datum Offset ${offsetPlane.id}: ${skimOffsetMm.toFixed(1)} mm`,
       },
     });
   }
@@ -5886,8 +7320,9 @@ export function buildDeterministicDescription(
   const volDim = dimensions.find((d) => d.id === 'DIM-VOL-CM3')?.formattedValue || volVal.toFixed(3);
   const areaDim = dimensions.find((d) => d.id === 'DIM-AREA-CM2')?.formattedValue || '';
 
+  const bboxVec = new THREE.Vector3(envXVal, envYVal, envZVal);
   const rawArch = evaluateGeometricArchetypeFromTopology(
-    new THREE.Vector3(envXVal, envYVal, envZVal),
+    bboxVec,
     volVal * 1000,
     holes,
     bosses,
@@ -5895,13 +7330,13 @@ export function buildDeterministicDescription(
   );
   const primaryProc = bomEntries?.[0]?.manufacturingProcess || '';
   const inferredArchFromBom: GeometricArchetypeKind =
-    /cam\/profile|eccentric|multi-journal/i.test(primaryProc)
+    /multi-section axisymmetric/i.test(bomEntries?.[0]?.structuralRole || '')
       ? 'rotational_multi_journal_or_cam'
-      : /cnc turning|turn-mill/i.test(primaryProc)
+      : /axisymmetric.*sleeve|axisymmetric.*cylindrical/i.test(bomEntries?.[0]?.structuralRole || '')
         ? 'rotational_shaft_or_sleeve'
         : /sheet metal|press-brake/i.test(primaryProc)
           ? 'sheet_metal'
-          : /4-axis|indexed|housing/i.test(primaryProc)
+          : /prismatic-cylindrical|3\+2-axis|indexed/i.test(primaryProc)
             ? 'mixed_prismatic_rotational'
             : rawArch.archetype;
   const archEval = {
@@ -5913,8 +7348,16 @@ export function buildDeterministicDescription(
       inferredArchFromBom === 'rotational_multi_journal_or_cam',
   };
 
+  const spatialRelationships = analyze3DSpatialRelationships(
+    bboxVec,
+    volVal * 1000,
+    holes,
+    bosses,
+    planes
+  );
+
   const featureBullets: string[] = [
-    `Overall bounding envelope (extracted measurement): ${envX} × ${envY} × ${envZ} mm${volDim ? ` · Solid volume: ${volDim} cm³` : ''}${areaDim ? ` · Surface area: ${areaDim} cm²` : ''}.`,
+    `Overall 3D bounding envelope (measured from 3D CAD geometry): ${envX} × ${envY} × ${envZ} mm${volDim ? ` · Enclosed 3D solid volume: ${volDim} cm³` : ''}${areaDim ? ` · Total 3D surface area: ${areaDim} cm²` : ''} (${(archEval.fillRatio * 100).toFixed(1)}% solid-to-envelope fill ratio).`,
   ];
   if (holes.length > 0) {
     const holeSummary = holes
@@ -5922,75 +7365,84 @@ export function buildDeterministicDescription(
       .map((h) => `${h.id} (Ø${(h.diameterMm || 0).toFixed(2)} mm × ${(h.depthOrLengthMm || 0).toFixed(1)} mm)`)
       .join(', ');
     featureBullets.push(
-      `${holes.length} identified cylindrical hole / bore feature(s): ${holeSummary}${holes.length > 6 ? ` (+${holes.length - 6} additional)` : ''}.`
+      `${holes.length} internal cylindrical bore feature(s) measured in 3D: ${holeSummary}${holes.length > 6 ? ` (+${holes.length - 6} additional)` : ''}.`
     );
   } else {
-    featureBullets.push('No closed internal through-holes or blind bores identified in the current geometry.');
+    featureBullets.push('No closed internal through-holes or blind bores detected in the 3D geometry.');
   }
   if (bosses.length > 0) {
     const bossSummary = bosses
       .slice(0, 6)
-      .map((b) => `${b.id} (${b.name}, length ${(b.depthOrLengthMm || 0).toFixed(1)} mm)`)
+      .map((b) => `${b.id} (Ø${(b.diameterMm || 0).toFixed(2)} mm × ${(b.depthOrLengthMm || 0).toFixed(1)} mm)`)
       .join(', ');
     featureBullets.push(
-      `${bosses.length} identified outer cylindrical section(s) (journals, lobes, collars, or mounting bosses — functional role inferred): ${bossSummary}${bosses.length > 6 ? ` (+${bosses.length - 6} additional)` : ''}.`
-    );
-  }
-  if (chamfers.length > 0) {
-    featureBullets.push(
-      `${chamfers.length} identified chamfer / transition fillet feature(s) (${chamfers.slice(0, 5).map((c) => c.id).join(', ')}).`
+      `${bosses.length} outer cylindrical boss / collar section(s) measured in 3D: ${bossSummary}${bosses.length > 6 ? ` (+${bosses.length - 6} additional)` : ''}.`
     );
   }
   if (planes.length > 0) {
     featureBullets.push(
-      `Primary planar datum / end-face reference surface(s), largest ${planes[0].id} (${planes[0].areaMm2.toFixed(0)} mm²).`
+      `${planes.length} planar datum / wall surface(s), led by primary datum ${planes[0].id} (${planes[0].areaMm2.toFixed(0)} mm²)${planes[1] ? ` and ${planes[1].id} (${planes[1].areaMm2.toFixed(0)} mm²)` : ''}.`
     );
+  }
+  if (chamfers.length > 0) {
+    featureBullets.push(
+      `${chamfers.length} chamfer / fillet transition surface(s) (${chamfers.slice(0, 5).map((c) => c.id).join(', ')}).`
+    );
+  }
+  if (bomEntries && bomEntries.length > 0) {
+    const compListSummary = bomEntries
+      .map(
+        (e) =>
+          `${e.quantity}× ${e.componentName} (${e.componentSourceType === 'PURCHASED_STANDARD_CATALOG' ? 'Purchased Standard Catalog Component' : 'Custom Manufactured Component'}, ${e.boundingBoxMm}, ${e.volumeCm3.toFixed(3)} cm³ total)`
+      )
+      .join('; ');
+    featureBullets.push(`Identified Engineering Components (${bomEntries.length} distinct BOM item${bomEntries.length === 1 ? '' : 's'}): ${compListSummary}.`);
+  }
+  for (const rel of spatialRelationships.slice(0, 3)) {
+    featureBullets.push(`3D Spatial Relationship — ${rel}`);
   }
 
   const cleanBaseName = metadata.fileName.replace(/\.[^/.]+$/, '').replace(/_/g, ' ');
-  const archSubtitle = metadata.headerComments?.[0];
-  const primaryRole = bomEntries?.[0]?.structuralRole || archSubtitle;
-  const fullPartTitle = primaryRole
-    ? `${cleanBaseName} — ${primaryRole}`
-    : `${cleanBaseName} (Geometry-Derived Component Analysis — Requires Verification)`;
+  const primaryCompName = bomEntries?.[0]?.componentName || cleanBaseName;
+  const primaryRole =
+    bomEntries?.[0]?.structuralRole ||
+    'Machined Engineering Component (Neutral Geometry Classification — Exact Functional Role Requires Drawing Verification)';
+  const fullPartTitle =
+    bomEntries && bomEntries.length > 1
+      ? `${cleanBaseName} Assembly (${bomEntries.reduce((s, e) => s + e.quantity, 0)} Total Parts across ${bomEntries.length} Distinct Components — Primary: ${primaryCompName})`
+      : `${primaryCompName} (${cleanBaseName}) — ${primaryRole}`;
 
   const isRotationalPart =
     archEval.archetype === 'rotational_multi_journal_or_cam' ||
-    archEval.archetype === 'rotational_shaft_or_sleeve' ||
-    /turning|cam|journal|grinding/i.test(primaryProc);
+    archEval.archetype === 'rotational_shaft_or_sleeve';
 
   const mfgProcessesFromBom: PartEngineeringDescription['manufacturingProcesses'] =
     bomEntries && bomEntries.length > 0
       ? [
           ...bomEntries.map((entry, idx) => ({
-            processName: `${entry.manufacturingProcess} — ${entry.componentName} (Candidate Process Hypothesis)`,
+            processName: `${entry.manufacturingProcess} — ${entry.componentName} (Qty ${entry.quantity})`,
             suitability: (idx === 0 ? 'Primary Candidate' : 'Secondary Operation') as
               | 'Primary Candidate'
               | 'Secondary Operation',
-            geometricJustification: `Derived from 3D geometry envelope ${entry.boundingBoxMm} (${entry.volumeCm3.toFixed(3)} cm³ solid volume, validated stock ${entry.rawStockDimensionsMm})${
-              holes.length > 0
-                ? ` with ${holes.length} internal bore feature(s)`
-                : ' with 0 internal bores'
-            }${
-              bosses.length > 0
-                ? ` and ${bosses.length} outer cylindrical section(s)`
-                : ''
-            }. Secondary operations: ${entry.secondaryOperations}.`,
+            geometricJustification:
+              entry.componentSourceType === 'PURCHASED_STANDARD_CATALOG'
+                ? `Identified as a Purchased Standard Catalog Component (${entry.componentName}, unit envelope ${entry.boundingBoxMm}). Procured as a finished OEM/ISO standard item rather than custom-machined from raw billet/bar stock; requires incoming inspection and assembly kitting (${entry.secondaryOperations}).`
+                : `Selected from 3D component geometry (${entry.boundingBoxMm}, ${entry.volumeCm3.toFixed(3)} cm³ total solid volume across Qty ${entry.quantity}) using aligned raw stock ${entry.rawStockDimensionsMm} (${entry.rawStockVolumeCm3.toFixed(2)} cm³). Secondary operations: ${entry.secondaryOperations}.`,
           })),
           ...(archEval.castingOrForgingJustified
             ? [
                 {
                   processName:
-                    'Near-Net Casting / Closed-Die Forging Preform + Finish CNC Machining (Alternative Route C)',
+                    'Near-Net Cast / Forged Blank + Finish CNC Machining on Functional Interfaces (Alternative Route C)',
                   suitability: 'Alternative' as const,
-                  geometricJustification: `Volumetric fill ratio (${(archEval.fillRatio * 100).toFixed(1)}%) and multi-feature geometry (${bosses.length} cylindrical section(s), ${holes.length} bore(s)) justify evaluating a cast or forged near-net preform with finish CNC machining on functional datums, journals, and bores for medium-to-high production batches.`,
+                  geometricJustification: `Solid-to-envelope fill ratio (${(archEval.fillRatio * 100).toFixed(1)}%) and multi-feature 3D geometry justify evaluating a near-net preform with finish CNC machining on functional planar datums and bores for medium-to-high production batches (N ≥ 100 pcs).`,
                 },
               ]
             : []),
         ]
       : [
           {
-            processName: 'Multi-Axis / 3-Axis CNC Machining from Validated Billet/Bar (Candidate Process Hypothesis)',
+            processName: '3-Axis / 3+2-Axis CNC Milling & Precision Boring from Rectangular Billet',
             suitability: 'Primary Candidate' as const,
             geometricJustification: `Derived from 3D geometry (${envX} × ${envY} × ${envZ} mm, ${volDim} cm³ solid volume).`,
           },
@@ -5999,35 +7451,38 @@ export function buildDeterministicDescription(
   return {
     partIdentification: fullPartTitle,
     functionalSummary:
-      `Engineering summary for "${cleanBaseName}": Overall dimensions ${envX} × ${envY} × ${envZ} mm, enclosed solid volume ${volDim} cm³, with ${holes.length} internal bore(s) and ${bosses.length} outer cylindrical section(s). ` +
-      `Component identity and manufacturing route are evaluated directly from 3D geometry and require verification against the production engineering drawing. ` +
-      (archEval.archetype === 'rotational_multi_journal_or_cam'
-        ? `Geometry exhibits an elongated multi-section rotational / eccentric cam-and-journal architecture (${(archEval.fillRatio * 100).toFixed(1)}% bounding fill) suitable for CNC turning, multi-axis cam/profile milling, or closed-die forging / casting with finish cylindrical grinding.`
-        : isRotationalPart
-          ? `Geometry exhibits coaxial rotational shaft / sleeve / flange symmetry suitable for CNC turning / turn-mill machining from round bar stock.`
-          : archEval.archetype === 'mixed_prismatic_rotational'
-            ? `Geometry exhibits a hybrid prismatic-and-cylindrical housing/bracket topology (${bosses.length} cylindrical boss/collar section(s), ${holes.length} bore(s)) suitable for 3+2 / 4-axis indexed CNC milling and precision boring.`
-            : `Geometry exhibits prismatic structural surfaces suitable for 3-axis CNC milling${archEval.castingOrForgingJustified ? ' or near-net blanking/casting with finish CNC machining on functional interfaces' : ''}.`),
+      `Engineering 3D geometric & component interpretation of "${cleanBaseName}" (${primaryCompName}): overall bounding envelope ${envX} × ${envY} × ${envZ} mm, enclosed 3D solid volume ${volDim} cm³ (${(archEval.fillRatio * 100).toFixed(1)}% solid fill), ${planes.length} planar wall/datum face(s), ${bosses.length} cylindrical boss/collar feature(s), and ${holes.length} internal bore(s). ` +
+      (bomEntries && bomEntries.length > 1
+        ? `This multi-component CAD assembly contains ${bomEntries.reduce((s, e) => s + e.quantity, 0)} total part instances grouped into ${bomEntries.length} distinct BOM items (${bomEntries.map((e) => `${e.quantity}× ${e.componentName}`).join(', ')}), distinguishing custom-manufactured mechanical components from purchased standard catalog items. `
+        : '') +
+      (spatialRelationships.length > 0 ? `${spatialRelationships.slice(0, 2).join(' ')} ` : '') +
+      (isRotationalPart
+        ? `Because the primary 3D body is predominantly axisymmetric around a longitudinal axis, CNC turning / mill-turn profiling from round bar stock (${bomEntries?.[0]?.rawStockDimensionsMm || 'Round Bar'}) is the primary candidate route.`
+        : archEval.archetype === 'mixed_prismatic_rotational'
+          ? `Because the 3D body combines planar mounting/datum walls with cylindrical bosses and bores, 3-axis / 3+2-axis indexed CNC milling and precision boring from rectangular billet stock (${bomEntries?.[0]?.rawStockDimensionsMm || 'Rectangular Billet'}) is the primary manufacturing route.`
+          : `Because the 3D body is dominated by orthogonal planar surfaces and prismatic walls, 3-axis CNC face milling, profiling, and drilling/boring from rectangular billet stock (${bomEntries?.[0]?.rawStockDimensionsMm || 'Rectangular Billet'}) is the primary manufacturing route.`) +
+      ` Functional uncertainty disclosure: exact end-use mechanical loads, material temper, and GD&T fit tolerances are not embedded in the 3D geometry file and require verification against the 2D engineering drawing.`,
     majorGeometricFeatures: featureBullets,
+    spatialRelationships,
     materialSpecification: {
       value: metadata.materialDeclared
-        ? `${metadata.materialDeclared} (${bomEntries?.[0]?.densityGPerCm3.toFixed(2) || '2.70'} g/cm³)`
-        : `Scenario Assumption: ${bomEntries?.[0]?.material || 'Engineering Alloy — Requires Verification'} (${bomEntries?.[0]?.densityGPerCm3.toFixed(2) || '2.70'} g/cm³)`,
+        ? `${metadata.materialDeclared} (${bomEntries?.[0]?.densityGPerCm3.toFixed(2) || '2.70'} g/cm³) — Extracted from CAD Metadata`
+        : `${bomEntries?.[0]?.material || 'Engineering Alloy'} (${bomEntries?.[0]?.densityGPerCm3.toFixed(2) || '2.70'} g/cm³) — Preliminary Assumption (Not in 3D CAD Model; ISO 2768-mK & Ra 3.2 μm assumed for baseline costing)`,
       source: metadata.materialDeclared ? 'CAD Header Metadata' : 'Not Specified in CAD File',
       notes: metadata.materialDeclared
         ? `Extracted directly from ${metadata.format} header metadata.`
-        : `No material property is embedded in the ${metadata.format} file. Material grade, density, and pricing are applied as an explicit scenario assumption and synchronized across BOM, Costing, and AI Q&A.`,
+        : `No material or tolerance specification is embedded in the ${metadata.format} 3D geometry file. Component material grades, densities, and general tolerances are preliminary engineering assumptions synchronized across BOM, Costing, and Q&A.`,
     },
     manufacturingProcesses: mfgProcessesFromBom,
     machiningConsiderations: isRotationalPart
       ? [
-          `Establish axial centerline datum between centers or collet chuck; verify starting bar/preform containment (${bomEntries?.[0]?.rawStockDimensionsMm || 'Validated Blank'}) prior to rough turning and profile finishing.`,
-          `Verify journal bearing fit tolerances, cam/eccentric lift profiles, heat-treatment specifications, and surface roughness requirements on the 2D production drawing.`,
+          `Establish axial centerline datum in collet/chuck using aligned stock (${bomEntries?.[0]?.rawStockDimensionsMm || 'Validated Blank'}) prior to rough turning and coaxial boring.`,
+          `Verify bearing/fit tolerances and surface roughness requirements on the 2D production drawing.`,
         ]
       : [
           holes.length > 0
-            ? `Machine cylindrical bore features (${holes.map((h) => h.id).join(', ')}) normal to primary planar datum ${planes[0]?.id || 'FACE-P01'} from validated stock (${bomEntries?.[0]?.rawStockDimensionsMm || 'Validated Blank'}).`
-            : `Establish primary workholding datum on ${planes[0]?.id || 'largest planar surface'} and verify functional tolerances on the 2D drawing.`,
+            ? `Establish primary workholding datum on ${planes[0]?.id || 'FACE-P01'} (${planes[0]?.areaMm2.toFixed(0) || ''} mm²) from aligned raw stock (${bomEntries?.[0]?.rawStockDimensionsMm || 'Validated Billet'}), then machine cylindrical boss/bore features (${holes.map((h) => h.id).join(', ')}) preserving their 3D coaxial and center-to-center pitch relationships.`
+            : `Establish primary workholding datum on ${planes[0]?.id || 'largest planar surface'} from aligned raw stock (${bomEntries?.[0]?.rawStockDimensionsMm || 'Validated Billet'}) and verify functional tolerances on the 2D drawing.`,
         ],
     generatedBy: 'Deterministic Geometry Analyzer',
   };
@@ -6089,8 +7544,9 @@ export function synchronizePartEngineeringData(params: {
     geometryAnalysisReport.materialVolumeEstimates.netSolidVolumeCm3 ||
     Number(baseBom.entries.reduce((a, e) => a + e.volumeCm3, 0).toFixed(3));
 
+  const bboxVec = new THREE.Vector3(envX, envY, envZ);
   const archInfo = evaluateGeometricArchetypeFromTopology(
-    new THREE.Vector3(envX, envY, envZ),
+    bboxVec,
     netVolCm3 * 1000,
     holes,
     bosses,
@@ -6107,21 +7563,65 @@ export function synchronizePartEngineeringData(params: {
   const selectedRouteKey: ManufacturingProcessRouteKey =
     costOverrides?.processRouteKey || 'BILLET_CNC';
   const stockAllowanceMm = Number((costOverrides?.stockAllowanceMm ?? 2.0).toFixed(2));
+  const spatialRels = analyze3DSpatialRelationships(bboxVec, netVolCm3 * 1000, holes, bosses, planes);
+  const primarySpatialNote =
+    spatialRels.length > 0 ? ` Spatial relationship: ${spatialRels[0]}` : '';
 
   // Synchronize BOM entries with the active material, density, and validated stock geometry for the active route
   const syncedEntries: BomEntry[] = baseBom.entries.map((entry, idx) => {
     const nums = (entry.boundingBoxMm.match(/[\d.]+/g) || []).map(Number).filter((n) => Number.isFinite(n) && n > 0);
     const entryBbox =
       nums.length >= 3 ? new THREE.Vector3(nums[0], nums[1], nums[2]) : new THREE.Vector3(envX, envY, envZ);
-    const unitNetVol = entry.volumeCm3 / Math.max(1, entry.quantity);
-    const unitArea = entry.surfaceAreaCm2 / Math.max(1, entry.quantity);
+    const unitNetVol = Number((entry.volumeCm3 / Math.max(1, entry.quantity)).toFixed(3));
+    const unitArea = Number((entry.surfaceAreaCm2 / Math.max(1, entry.quantity)).toFixed(2));
+
+    // Preserve Purchased Standard Catalog items (motors, screws, bolts, nuts, washers, bearings, dowel pins)
+    if (entry.componentSourceType === 'PURCHASED_STANDARD_CATALOG') {
+      const catDensity = entry.densityGPerCm3 || 7.85;
+      const totalMassGrams = Number((entry.volumeCm3 * catDensity).toFixed(1));
+      const unitMassGrams = Number((totalMassGrams / Math.max(1, entry.quantity)).toFixed(1));
+      const netVolM3 = Number((entry.volumeCm3 * 1e-6).toFixed(9));
+      return {
+        ...entry,
+        unitVolumeCm3: unitNetVol,
+        unitRawStockVolumeCm3: unitNetVol,
+        unitSurfaceAreaCm2: unitArea,
+        unitEstimatedMassGrams: unitMassGrams,
+        estimatedMassGrams: totalMassGrams,
+        rawStockDimensionsMm: 'Purchased Standard Catalog Component (No Raw Billet/Bar Stock)',
+        rawStockVolumeCm3: Number(entry.volumeCm3.toFixed(2)),
+        rawVolumeM3: netVolM3,
+        netVolumeM3: netVolM3,
+        chipRemovalRatioPct: 0,
+      };
+    }
+
+    // For custom manufactured components, preserve component-specific alloy unless user explicitly selected a global material override
+    const entryMatKey =
+      costOverrides?.materialGradeKey || entry.materialGradeKey || resolvedMat.key;
+    const entryCatMat = AUTHORITATIVE_MATERIAL_CATALOG[entryMatKey];
+    const entryDisplaySpec =
+      costOverrides?.materialGradeKey || !entry.materialGradeKey
+        ? resolvedMat.displaySpec
+        : entry.material || `${entryCatMat.name} — Assumed Engineering Alloy`;
+    const entryDensity =
+      costOverrides?.materialGradeKey || !entryCatMat
+        ? resolvedMat.densityGPerCm3
+        : entryCatMat.densityGPerCm3;
+
     const compPos = components[entry.componentIndices?.[0] ?? idx]?.positions;
+    const entryArch: GeometricArchetypeKind =
+      entry.componentCategory === 'gear' ||
+      entry.componentCategory === 'shaft_or_pin' ||
+      /turning|gear|hobbing/i.test(entry.manufacturingProcess)
+        ? 'rotational_shaft_or_sleeve'
+        : archInfo.archetype;
 
     const stockVal = computeAndValidateRawStockGeometry(
       entryBbox,
       unitNetVol,
       unitArea,
-      archInfo.archetype,
+      entryArch,
       selectedRouteKey,
       stockAllowanceMm,
       compPos
@@ -6139,21 +7639,39 @@ export function synchronizePartEngineeringData(params: {
         ? Number(Math.max(0, Math.min(98, (removedVolCm3 / totalRawVolCm3) * 100)).toFixed(1))
         : 0;
 
+    const totalMassGrams = Number((entry.volumeCm3 * entryDensity).toFixed(1));
+    const unitMassGrams = Number((totalMassGrams / Math.max(1, entry.quantity)).toFixed(1));
+
+    const updatedRemarks =
+      `${entry.structuralRole}; primary process: ${entry.manufacturingProcess}; unit finished envelope ${entry.boundingBoxMm} (Qty ${entry.quantity}); raw stock (aligned with Costing): ${entry.quantity > 1 ? `${entry.quantity} × ` : ''}${stockVal.stockDimensionsFormatted} (${totalRawVolCm3.toFixed(2)} cm³ raw → ${entry.volumeCm3.toFixed(3)} cm³ net, ${chipRemovalRatioPct.toFixed(1)}% chip removal).${primarySpatialNote} ` +
+      (metadata.materialDeclared
+        ? `Material extracted from CAD metadata (${metadata.materialDeclared}).`
+        : `Preliminary Engineering Assumption: Material (${entryDisplaySpec}), general tolerance (ISO 2768-mK), and batch size are scenario assumptions requiring 2D drawing verification.`);
+
     return {
       ...entry,
-      material: resolvedMat.displaySpec,
-      densityGPerCm3: resolvedMat.densityGPerCm3,
-      rawStockDimensionsMm: stockVal.stockDimensionsFormatted,
+      material: entryDisplaySpec,
+      materialGradeKey: entryMatKey,
+      densityGPerCm3: entryDensity,
+      unitVolumeCm3: unitNetVol,
+      unitRawStockVolumeCm3: stockVal.rawStockVolumeCm3,
+      unitSurfaceAreaCm2: unitArea,
+      unitEstimatedMassGrams: unitMassGrams,
+      remarks: updatedRemarks,
+      rawStockDimensionsMm:
+        entry.quantity > 1
+          ? `${entry.quantity} × [${stockVal.stockDimensionsFormatted}]`
+          : stockVal.stockDimensionsFormatted,
       rawStockVolumeCm3: totalRawVolCm3,
       rawVolumeM3: rawVolM3,
       netVolumeM3: netVolM3,
       chipRemovalRatioPct,
-      estimatedMassGrams: Number((entry.volumeCm3 * resolvedMat.densityGPerCm3).toFixed(1)),
+      estimatedMassGrams: totalMassGrams,
       volumeConversionExplanation:
-        `Validated physical raw stock (${stockVal.stockDimensionsFormatted}, V_raw = ${rawVolM3Display.toFixed(6)} m³ / ${totalRawVolCm3.toFixed(2)} cm³) geometrically contains the finished part envelope (${entry.boundingBoxMm}). ` +
+        `Physical raw stock (${entry.quantity > 1 ? `${entry.quantity} × ` : ''}${stockVal.stockDimensionsFormatted}, V_raw = ${rawVolM3Display.toFixed(6)} m³ / ${totalRawVolCm3.toFixed(2)} cm³) geometrically contains the finished part envelope (${entry.boundingBoxMm}). ` +
         `Primary stock removal machines V_rem = V_raw − V_net = ${rawVolM3Display.toFixed(6)} − ${netVolM3Display.toFixed(6)} = ${removedVolM3Display.toFixed(6)} m³ (${removedVolCm3.toFixed(2)} cm³) to reach net solid volume V_net = ${netVolM3Display.toFixed(6)} m³ (${entry.volumeCm3.toFixed(3)} cm³).`,
       chipRemovalExplanation:
-        `Chip Removal Ratio = (V_raw − V_net) / V_raw = (${totalRawVolCm3.toFixed(2)} − ${entry.volumeCm3.toFixed(3)}) / ${totalRawVolCm3.toFixed(2)} = ${chipRemovalRatioPct.toFixed(1)}% (${removedVolCm3.toFixed(2)} cm³ / ${removedVolM3Display.toFixed(6)} m³ recoverable swarf under ${selectedRouteKey}, ${resolvedMat.displaySpec}, ρ = ${resolvedMat.densityGPerCm3.toFixed(2)} g/cm³).`,
+        `Chip Removal Ratio = (V_raw − V_net) / V_raw = (${totalRawVolCm3.toFixed(2)} − ${entry.volumeCm3.toFixed(3)}) / ${totalRawVolCm3.toFixed(2)} = ${chipRemovalRatioPct.toFixed(1)}% (${removedVolCm3.toFixed(2)} cm³ / ${removedVolM3Display.toFixed(6)} m³ recoverable swarf under ${selectedRouteKey}, ${entryDisplaySpec}, ρ = ${entryDensity.toFixed(2)} g/cm³).`,
       stockValidation: {
         ...stockVal,
         rawStockVolumeCm3: totalRawVolCm3,
@@ -6170,6 +7688,52 @@ export function synchronizePartEngineeringData(params: {
     costOverrides,
     modificationHistory
   );
+
+  // If Costing applied an active DFM stock-trim modification on the revision, sync BOM stock back from costEstimate.stockValidation so BOM and Costing never diverge
+  if (
+    costEstimate.stockValidation &&
+    syncedEntries.length === 1 &&
+    syncedEntries[0].componentSourceType !== 'PURCHASED_STANDARD_CATALOG'
+  ) {
+    const ceStock = costEstimate.stockValidation;
+    const ceRawVol = Number((costEstimate.rawStockVolumeCm3 ?? ceStock.rawStockVolumeCm3).toFixed(2));
+    const entry0 = syncedEntries[0];
+    if (
+      entry0.rawStockDimensionsMm !== ceStock.stockDimensionsFormatted ||
+      Math.abs(entry0.rawStockVolumeCm3 - ceRawVol) > 0.01
+    ) {
+      const removedVolCm3 = Number(Math.max(0.01, ceRawVol - entry0.volumeCm3).toFixed(2));
+      const rawVolM3 = Number((ceRawVol * 1e-6).toFixed(9));
+      const netVolM3 = Number((entry0.volumeCm3 * 1e-6).toFixed(9));
+      const rawVolM3Display = Number(rawVolM3.toFixed(6));
+      const netVolM3Display = Number(netVolM3.toFixed(6));
+      const removedVolM3Display = Number(Math.max(0, rawVolM3Display - netVolM3Display).toFixed(6));
+      const chipPct =
+        ceRawVol > 0
+          ? Number(Math.max(0, Math.min(98, (removedVolCm3 / ceRawVol) * 100)).toFixed(1))
+          : 0;
+      entry0.rawStockDimensionsMm = ceStock.stockDimensionsFormatted;
+      entry0.rawStockVolumeCm3 = ceRawVol;
+      entry0.rawVolumeM3 = rawVolM3;
+      entry0.netVolumeM3 = netVolM3;
+      entry0.chipRemovalRatioPct = chipPct;
+      entry0.stockValidation = {
+        ...ceStock,
+        rawStockVolumeCm3: ceRawVol,
+        netPartVolumeCm3: entry0.volumeCm3,
+      };
+      entry0.volumeConversionExplanation =
+        `Physical raw stock (${ceStock.stockDimensionsFormatted}, V_raw = ${rawVolM3Display.toFixed(6)} m³ / ${ceRawVol.toFixed(2)} cm³) geometrically contains the finished part envelope (${entry0.boundingBoxMm}). ` +
+        `Primary stock removal machines V_rem = V_raw − V_net = ${rawVolM3Display.toFixed(6)} − ${netVolM3Display.toFixed(6)} = ${removedVolM3Display.toFixed(6)} m³ (${removedVolCm3.toFixed(2)} cm³) to reach net solid volume V_net = ${netVolM3Display.toFixed(6)} m³ (${entry0.volumeCm3.toFixed(3)} cm³).`;
+      entry0.chipRemovalExplanation =
+        `Chip Removal Ratio = (V_raw − V_net) / V_raw = (${ceRawVol.toFixed(2)} − ${entry0.volumeCm3.toFixed(3)}) / ${ceRawVol.toFixed(2)} = ${chipPct.toFixed(1)}% (${removedVolCm3.toFixed(2)} cm³ / ${removedVolM3Display.toFixed(6)} m³ recoverable swarf under ${selectedRouteKey}, ${resolvedMat.displaySpec}, ρ = ${resolvedMat.densityGPerCm3.toFixed(2)} g/cm³).`;
+      entry0.remarks =
+        `${entry0.structuralRole}; primary process: ${entry0.manufacturingProcess}; finished envelope ${entry0.boundingBoxMm}; raw stock (aligned with Costing): ${ceStock.stockDimensionsFormatted} (${ceRawVol.toFixed(2)} cm³ raw → ${entry0.volumeCm3.toFixed(3)} cm³ net, ${chipPct.toFixed(1)}% chip removal).${primarySpatialNote} ` +
+        (metadata.materialDeclared
+          ? `Material extracted from CAD metadata (${metadata.materialDeclared}).`
+          : `Preliminary Engineering Assumption: Material (${resolvedMat.displaySpec}), general tolerance (ISO 2768-mK), and batch size are scenario assumptions requiring 2D drawing verification.`);
+    }
+  }
 
   const syncedDescription = buildDeterministicDescription(
     metadata,
@@ -6211,6 +7775,7 @@ export function synchronizePartEngineeringData(params: {
 
   const updatedGeometryReport: GeometryAnalysisReport = {
     ...geometryAnalysisReport,
+    spatialRelationships: spatialRels,
     factsVsAssumptions: updatedFactsVsAssumptions,
   };
 

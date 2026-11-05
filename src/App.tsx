@@ -4,7 +4,6 @@ import {
   ArrowRight,
   CheckCircle2,
   Download,
-  Globe,
   Loader2,
   MessageSquare,
   RefreshCw,
@@ -295,17 +294,17 @@ export default function App() {
       setIsProcessingUpload(false);
       setProcessingStage('');
 
-      // Initialize the Part Engineering & Cost Chatbot with a grounded summary of the uploaded part
+      // Initialize the Part Engineering and Cost Assistant with a concise 3D-grounded summary of the uploaded part
       setChatMessages([
         {
           id: `MSG-INIT-${Date.now()}`,
           role: 'assistant',
-          content: `Loaded **${metadata.fileName}** (${metadata.format}) — Revision **v1**.\n• **Envelope (CAD Measurement)**: ${envX.toFixed(2)} × ${envY.toFixed(2)} × ${envZ.toFixed(2)} mm | **Net Solid Volume**: **${costEstimate.authoritativeVolumeCm3 ?? geometryAnalysisReport.materialVolumeEstimates.netSolidVolumeCm3} cm³** (Consistent across Stage 1B, Stage 4 BOM, and Stage 6)\n• **Candidate Process Route**: ${costEstimate.alignedManufacturingProcess} (Material Assumption: *${costEstimate.assumedOrDeclaredMaterial}* — ${costEstimate.materialDensityGPerCm3} g/cm³)\n• **Validated Raw Stock**: ${costEstimate.stockValidation?.stockDimensionsFormatted || bom.entries[0]?.rawStockDimensionsMm || 'Validated Blank'} (3D Containment: **${costEstimate.stockValidation?.geometricallyContainsPart !== false ? 'VERIFIED' : 'ENGINEERING REVIEW REQUIRED'}**)\n• **Scenario-Based Manufacturing Cost Estimate (${costEstimate.batchSize ?? 1}-pc batch)**: **${costEstimate.costBreakdownPerUnit.totalUnitCostSek.toFixed(2)} SEK** (€${costEstimate.costBreakdownPerUnit.totalUnitCostEur.toFixed(2)} EUR) — Validation Status: **${costEstimate.validationReport?.overallStatus ?? 'VALIDATED_WITH_ASSUMPTIONS'}**\n\nAsk me anything about this part's 2D drawings, CAD measurements vs. costing assumptions, explicit cost equations, process route comparisons, or 3D modifications!`,
+          content: `Loaded **${metadata.fileName}** (${metadata.format}) — Revision **v1**.\n• **3D Dimension Extraction Basis**: Measured directly from the 3D CAD model coordinates — Overall Envelope **${envX.toFixed(2)} × ${envY.toFixed(2)} × ${envZ.toFixed(2)} mm** | Enclosed 3D Solid Volume **${costEstimate.authoritativeVolumeCm3 ?? geometryAnalysisReport.materialVolumeEstimates.netSolidVolumeCm3} cm³**\n• **BOM & Manufacturing Route**: ${bom.entries.length} BOM component(s) → **${costEstimate.alignedManufacturingProcess}**\n• **Material & Specifications**: *${costEstimate.assumedOrDeclaredMaterial}* (${costEstimate.materialDensityGPerCm3} g/cm³) — ${metadata.materialDeclared ? 'Extracted from CAD file metadata' : 'Predicted / Assumed for costing because material & 2D tolerances are not embedded in the 3D geometry'}\n• **Final Part Cost (Sum of BOM Components, N=${costEstimate.batchSize ?? 10} pcs)**: **${costEstimate.costBreakdownPerUnit.totalUnitCostSek.toFixed(2)} SEK** (€${costEstimate.costBreakdownPerUnit.totalUnitCostEur.toFixed(2)} EUR)\n\nAsk any question about the ${metadata.fileName} part.`,
           timestamp: new Date().toISOString(),
           referencedSections: [
-            'Stage 1: 2D Engineering Drawings & Geometric Feature Summary',
+            'Stage 1: 3D-to-2D Views & 3D Extracted Dimensions',
             'Stage 4: Consolidated Bill of Materials',
-            'Stage 6: Scenario-Based Manufacturing Cost Estimate',
+            'Stage 6: Component & Final Part Cost Calculation',
           ],
         },
       ]);
@@ -689,10 +688,10 @@ export default function App() {
               Interactive 3D Modification
             </a>
             <a href="#stage-6" className="hover:text-amber-400 text-amber-300/90 whitespace-nowrap shrink-0">
-              Per-Piece Cost &amp; 3D DFM
+              Per-Piece Manufacturing Cost
             </a>
             <a href="#stage-7" className="hover:text-sky-400 text-sky-300/90 whitespace-nowrap shrink-0">
-              Part AI Q&amp;A
+              Part Engineering &amp; Cost Assistant
             </a>
           </nav>
         ) : (
@@ -794,15 +793,22 @@ export default function App() {
                     <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-3">
                       <div>
                         <h2 className="text-lg font-bold text-slate-100 font-display">
-                          1A. Manufacturing 2D Engineering Drawing &amp; 3D Part Photographs — {currentVersion.metadata.fileName}
+                          1A. 3D-to-2D Engineering Views &amp; 3D Part Photographs — {currentVersion.metadata.fileName}
                         </h2>
                         <p className="text-xs font-mono text-slate-400 mt-0.5">
-                          ASME Y14.3 / ISO 128 Standard · Top View, Section View, Front View, Side View &amp; ISO View (2D CAD Projections + Matched 3D Part Photographs)
+                          Projected directly from the 3D CAD model · Top View (+Z), Section View (Plane A-A), Front View (-Y), Side View (+X) &amp; ISO View
                         </p>
                       </div>
                       <span className="text-xs font-mono text-amber-400 bg-amber-950/50 border border-amber-800/60 px-2.5 py-1 rounded">
                         {currentVersion.versionLabel}
                       </span>
+                    </div>
+
+                    <div className="p-3.5 rounded-lg bg-slate-950 border border-sky-800/60 text-xs text-slate-200 leading-relaxed">
+                      <span className="font-mono font-bold text-sky-400 uppercase">
+                        How Views &amp; Dimensions Are Extracted (3D vs. 2D):{' '}
+                      </span>
+                      We first read the <span className="font-semibold text-slate-100">3D CAD model geometry</span> in 3D space (millimeters) and project it onto standard 2D orthographic views (Top, Front, Side, and Section A-A). All dimensions are <span className="font-semibold text-emerald-300">measured directly from the 3D CAD model coordinates</span> — not estimated from 2D pixels — so every 2D view callout correlates 1:1 with the actual 3D solid.
                     </div>
 
                     {/* Primary Row: 3D Part Photograph (ISO View) + Master Third-Angle 2D Engineering Drawing Sheet */}
@@ -1100,49 +1106,65 @@ export default function App() {
                         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-3">
                           <div>
                             <h2 className="text-lg font-bold text-slate-100 font-display">
-                              1B. Geometric Feature Extraction &amp; Engineering Summary
+                              1B. 3D-Extracted Dimensions &amp; Engineering Specifications Summary
                             </h2>
                             <p className="text-xs font-mono text-slate-400 mt-0.5">
-                              Concise engineering summary distinguishing directly extracted CAD measurements from inferred geometric features and specifications requiring verification
+                              Overall dimensions and features measured directly from the 3D CAD model vs. specifications predicted/assumed when not present in the 3D file
                             </p>
                           </div>
-                          <span className="text-xs font-mono text-sky-300 bg-sky-950/50 border border-sky-800/60 px-2.5 py-1 rounded">
-                            Extracted Measurements vs. Inferred Features
+                          <span className="text-xs font-mono text-emerald-300 bg-emerald-950/50 border border-emerald-800/60 px-2.5 py-1 rounded">
+                            Measured from 3D CAD Model
                           </span>
                         </div>
 
-                        {/* 1. Extracted Measurements (Directly Measured from CAD Geometry) */}
+                        {/* Clear Explanation of 3D Measurement vs Predicted Specifications */}
+                        <div className="p-3.5 rounded-lg bg-slate-950 border border-slate-800 text-xs text-slate-300 leading-relaxed space-y-1">
+                          <div>
+                            <span className="font-mono font-bold text-emerald-400">
+                              1. Measured Directly from the 3D CAD Model:{' '}
+                            </span>
+                            Overall bounding dimensions (ΔX × ΔY × ΔZ), enclosed 3D solid volume, total 3D surface area, and cylindrical bore/boss diameters are computed directly in 3D space from the uploaded CAD geometry and correlated to the 2D views above.
+                          </div>
+                          <div>
+                            <span className="font-mono font-bold text-amber-300">
+                              2. Predicted / Assumed When Not in the 3D CAD Model:{' '}
+                            </span>
+                            A 3D CAD geometry file defines 3D shape and volume, but often does not embed 2D drawing notes such as exact alloy temper, GD&amp;T fit tolerances (e.g., H7/g6), thread pitch callouts, or surface roughness (Ra). Any such specification is explicitly labeled as <span className="font-mono text-amber-300 font-semibold">Predicted / Assumed</span> below.
+                          </div>
+                        </div>
+
+                        {/* 1. Overall Dimensions & Volume (Measured from 3D CAD Geometry) */}
                         <div className="space-y-2.5">
                           <div className="flex flex-wrap items-center justify-between gap-2">
                             <h3 className="text-xs font-mono font-bold uppercase tracking-wider text-emerald-400">
-                              Extracted Measurements (Directly Measured from 3D Geometry)
+                              Overall Dimensions &amp; Physical Properties (Measured from 3D CAD Model)
                             </h3>
                             <span className="text-[11px] font-mono text-slate-400">
-                              Grounded in CAD coordinate bounds and enclosed solid volume
+                              Correlated 1:1 with the 3D model and 2D orthographic projections
                             </span>
                           </div>
 
                           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs font-mono">
                             <div className="p-3.5 rounded-lg bg-slate-950 border border-slate-800">
                               <div className="flex items-center justify-between gap-1">
-                                <span className="text-slate-400">Overall Dimensions (ΔX × ΔY × ΔZ)</span>
+                                <span className="text-slate-400">Overall Envelope (ΔX × ΔY × ΔZ)</span>
                                 <span className="px-1.5 py-0.5 text-[9px] bg-emerald-950 text-emerald-300 border border-emerald-800 rounded">
-                                  EXTRACTED
+                                  3D MEASURED
                                 </span>
                               </div>
                               <div className="text-sm font-bold text-slate-100 mt-1">
                                 {report.boundingDimensionsMm.lengthX.toFixed(2)} × {report.boundingDimensionsMm.widthY.toFixed(2)} × {report.boundingDimensionsMm.heightZ.toFixed(2)} mm
                               </div>
                               <div className="text-[11px] text-slate-400 mt-1">
-                                3D Envelope Diagonal: {report.boundingDimensionsMm.diagonal3D.toFixed(2)} mm
+                                3D Diagonal: {report.boundingDimensionsMm.diagonal3D.toFixed(2)} mm
                               </div>
                             </div>
 
                             <div className="p-3.5 rounded-lg bg-slate-950 border border-emerald-800/70">
                               <div className="flex items-center justify-between gap-1">
-                                <span className="text-slate-400">Solid Volume</span>
+                                <span className="text-slate-400">3D Solid Volume</span>
                                 <span className="px-1.5 py-0.5 text-[9px] bg-emerald-950 text-emerald-300 border border-emerald-800 rounded">
-                                  EXTRACTED
+                                  3D MEASURED
                                 </span>
                               </div>
                               <div className="text-sm font-bold text-emerald-400 mt-1">
@@ -1155,279 +1177,196 @@ export default function App() {
 
                             <div className="p-3.5 rounded-lg bg-slate-950 border border-slate-800">
                               <div className="flex items-center justify-between gap-1">
-                                <span className="text-slate-400">Surface Area &amp; Envelope Fill</span>
+                                <span className="text-slate-400">3D Surface Area &amp; Solid Ratio</span>
                                 <span className="px-1.5 py-0.5 text-[9px] bg-emerald-950 text-emerald-300 border border-emerald-800 rounded">
-                                  EXTRACTED
+                                  3D MEASURED
                                 </span>
                               </div>
                               <div className="text-sm font-bold text-slate-100 mt-1">
                                 {report.materialVolumeEstimates.totalSurfaceAreaCm2.toFixed(2)} cm²
                               </div>
                               <div className="text-[11px] text-slate-400 mt-1">
-                                Envelope Box: {report.materialVolumeEstimates.boundingEnvelopeVolumeCm3.toFixed(2)} cm³ ({report.materialVolumeEstimates.volumetricFillRatioPct}% solid ratio)
+                                Bounding Box: {report.materialVolumeEstimates.boundingEnvelopeVolumeCm3.toFixed(2)} cm³ ({report.materialVolumeEstimates.volumetricFillRatioPct}% solid fill)
                               </div>
                             </div>
 
                             <div className="p-3.5 rounded-lg bg-slate-950 border border-slate-800">
                               <div className="flex items-center justify-between gap-1">
-                                <span className="text-slate-400">Pattern &amp; Pitch Measurements</span>
+                                <span className="text-slate-400">Primary Datum / Feature Pitch</span>
                                 <span className="px-1.5 py-0.5 text-[9px] bg-emerald-950 text-emerald-300 border border-emerald-800 rounded">
-                                  {spacingDims.length > 0 ? 'EXTRACTED' : 'DATUM REF'}
+                                  3D MEASURED
                                 </span>
                               </div>
                               <div className="text-sm font-bold text-slate-100 mt-1 truncate">
                                 {spacingDims.length > 0
                                   ? `${spacingDims[0].formattedValue} ${spacingDims[0].unit}`
-                                  : `${planarFeatures.length > 0 ? `${planarFeatures[0].areaMm2.toFixed(0)} mm² Primary Datum` : 'Single Solid Body'}`}
+                                  : `${planarFeatures.length > 0 ? `${planarFeatures[0].areaMm2.toFixed(0)} mm² Datum Face` : 'Single 3D Solid Body'}`}
                               </div>
                               <div className="text-[11px] text-slate-400 mt-1 truncate">
                                 {spacingDims.length > 0
                                   ? spacingDims[0].parameter
-                                  : 'Primary datum plane area measured from geometry'}
+                                  : 'Largest flat mounting/reference face on 3D model'}
                               </div>
                             </div>
                           </div>
                         </div>
 
-                        {/* 2. Identifiable Geometric Features Summary (Extracted Measurements vs. Inferred Features) */}
-                        <div className="space-y-2.5">
-                          <div className="flex flex-wrap items-center justify-between gap-2">
-                            <h3 className="text-xs font-mono font-bold uppercase tracking-wider text-sky-400">
-                              Identifiable Geometric Features Summary
-                            </h3>
-                            <span className="text-[11px] font-mono text-slate-400">
-                              Displays feature counts and dimensions only when supported by geometric analysis
-                            </span>
-                          </div>
-
-                          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 text-xs">
-                            {/* Feature Category 1: Through-Holes and Blind Holes */}
-                            <div className="p-4 rounded-lg bg-slate-950 border border-slate-800 space-y-2 flex flex-col justify-between">
-                              <div className="space-y-1.5">
-                                <div className="flex items-center justify-between gap-2">
-                                  <span className="font-mono font-bold text-slate-100">
-                                    Through-Holes &amp; Blind Holes
-                                  </span>
-                                  <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-sky-950/90 text-sky-300 border border-sky-800">
-                                    {holeFeatures.length > 0
-                                      ? `${holeFeatures.length} Identified · Inferred Feature`
-                                      : 'None Identified'}
-                                  </span>
-                                </div>
-                                {holeFeatures.length > 0 ? (
-                                  <div className="space-y-1 font-mono text-[11px] text-slate-200 pt-1">
-                                    {holeFeatures.slice(0, 4).map((h) => (
-                                      <div
-                                        key={h.id}
-                                        className="flex items-center justify-between bg-slate-900/80 px-2.5 py-1 rounded border border-slate-800/80"
-                                      >
-                                        <span className="text-amber-300 font-semibold">{h.id}</span>
-                                        <span>
-                                          Ø{(h.diameterMm || 0).toFixed(2)} mm × Depth/Span {(h.depthOrLengthMm || 0).toFixed(2)} mm
-                                        </span>
-                                      </div>
-                                    ))}
-                                    {holeFeatures.length > 4 && (
-                                      <div className="text-[10px] text-slate-400">
-                                        + {holeFeatures.length - 4} additional cylindrical hole(s)
-                                      </div>
-                                    )}
-                                  </div>
-                                ) : (
-                                  <p className="text-slate-400 text-[11px]">
-                                    No closed internal cylindrical hole features identified in the current geometry.
-                                  </p>
-                                )}
+                        {/* 2. Concise 3D Feature & Specification Summary */}
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+                          {/* Card 1: Internal Bores & Holes */}
+                          <div className="p-4 rounded-lg bg-slate-950 border border-slate-800 space-y-2 flex flex-col justify-between">
+                            <div className="space-y-1.5">
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="font-mono font-bold text-slate-100">
+                                  Internal Bores &amp; Holes (3D)
+                                </span>
+                                <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-sky-950/90 text-sky-300 border border-sky-800">
+                                  {holeFeatures.length} Measured in 3D
+                                </span>
                               </div>
-                              <div className="pt-2 border-t border-slate-800/80 text-[11px] text-slate-400 font-mono">
-                                <span className="text-amber-300 font-semibold">Verification Note: </span>
-                                Bore diameter and axial span are extracted measurements; through vs. blind bottom termination, thread callouts, and fit tolerances require drawing/PMI verification.
-                              </div>
-                            </div>
-
-                            {/* Feature Category 2: Pockets and Cavities */}
-                            <div className="p-4 rounded-lg bg-slate-950 border border-slate-800 space-y-2 flex flex-col justify-between">
-                              <div className="space-y-1.5">
-                                <div className="flex items-center justify-between gap-2">
-                                  <span className="font-mono font-bold text-slate-100">
-                                    Pockets &amp; Cavities
-                                  </span>
-                                  <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-950/80 text-amber-300 border border-amber-800">
-                                    {largeCavityBores.length > 0
-                                      ? `${largeCavityBores.length} Cylindrical Cavity · Inferred`
-                                      : 'Requires Verification'}
-                                  </span>
-                                </div>
-                                {largeCavityBores.length > 0 ? (
-                                  <div className="space-y-1 font-mono text-[11px] text-slate-200 pt-1">
-                                    {largeCavityBores.slice(0, 3).map((c) => (
-                                      <div
-                                        key={c.id}
-                                        className="flex items-center justify-between bg-slate-900/80 px-2.5 py-1 rounded border border-slate-800/80"
-                                      >
-                                        <span className="text-amber-300 font-semibold">{c.id}</span>
-                                        <span>
-                                          Internal Cavity Bore Ø{(c.diameterMm || 0).toFixed(2)} mm × {(c.depthOrLengthMm || 0).toFixed(2)} mm
-                                        </span>
-                                      </div>
-                                    ))}
-                                  </div>
-                                ) : (
-                                  <p className="text-slate-300 text-[11px] leading-relaxed">
-                                    Envelope fill ratio is {report.materialVolumeEstimates.volumetricFillRatioPct}% ({(report.materialVolumeEstimates.boundingEnvelopeVolumeCm3 - report.materialVolumeEstimates.netSolidVolumeCm3).toFixed(2)} cm³ open/recessed volume relative to bounding box).
-                                  </p>
-                                )}
-                              </div>
-                              <div className="pt-2 border-t border-slate-800/80 text-[11px] text-slate-400 font-mono">
-                                <span className="text-amber-300 font-semibold">Requires Verification: </span>
-                                Non-cylindrical prismatic pockets and stepped recesses cannot be uniquely separated from exterior stepped planes without feature-tree history; verify pocket floor flatness and corner radii on 2D drawing.
-                              </div>
-                            </div>
-
-                            {/* Feature Category 3: Bosses and Mounting Features */}
-                            <div className="p-4 rounded-lg bg-slate-950 border border-slate-800 space-y-2 flex flex-col justify-between">
-                              <div className="space-y-1.5">
-                                <div className="flex items-center justify-between gap-2">
-                                  <span className="font-mono font-bold text-slate-100">
-                                    Bosses &amp; Mounting Features
-                                  </span>
-                                  <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-sky-950/90 text-sky-300 border border-sky-800">
-                                    {bossFeatures.length} Boss(es) · {Math.min(planarFeatures.length, 3)} Primary Datum(s)
-                                  </span>
-                                </div>
+                              {holeFeatures.length > 0 ? (
                                 <div className="space-y-1 font-mono text-[11px] text-slate-200 pt-1">
-                                  {bossFeatures.slice(0, 2).map((b) => (
+                                  {holeFeatures.slice(0, 4).map((h) => (
                                     <div
-                                      key={b.id}
+                                      key={h.id}
                                       className="flex items-center justify-between bg-slate-900/80 px-2.5 py-1 rounded border border-slate-800/80"
                                     >
-                                      <span className="text-emerald-300 font-semibold">{b.id}</span>
+                                      <span className="text-amber-300 font-semibold">{h.id}</span>
                                       <span>
-                                        Cylindrical Boss Ø{(b.diameterMm || 0).toFixed(2)} mm × {(b.depthOrLengthMm || 0).toFixed(2)} mm
+                                        Ø{(h.diameterMm || 0).toFixed(2)} mm × {(h.depthOrLengthMm || 0).toFixed(2)} mm
                                       </span>
                                     </div>
                                   ))}
-                                  {planarFeatures.slice(0, 2).map((p) => (
-                                    <div
-                                      key={p.id}
-                                      className="flex items-center justify-between bg-slate-900/80 px-2.5 py-1 rounded border border-slate-800/80"
-                                    >
-                                      <span className="text-sky-300 font-semibold">{p.id}</span>
-                                      <span>
-                                        Mounting / Datum Surface ({p.areaMm2.toFixed(0)} mm²)
-                                      </span>
+                                  {holeFeatures.length > 4 && (
+                                    <div className="text-[10px] text-slate-400">
+                                      + {holeFeatures.length - 4} additional bore(s) on 3D model
                                     </div>
-                                  ))}
+                                  )}
+                                  {largeCavityBores.length > 0 && (
+                                    <div className="text-[10px] text-emerald-300 pt-0.5">
+                                      Includes {largeCavityBores.length} primary internal bore/cavity (Ø ≥ 18 mm)
+                                    </div>
+                                  )}
                                 </div>
-                              </div>
-                              <div className="pt-2 border-t border-slate-800/80 text-[11px] text-slate-400 font-mono">
-                                <span className="text-amber-300 font-semibold">Verification Note: </span>
-                                Outer cylindrical diameters and planar surface areas are extracted measurements; functional mounting datum priority (A/B/C) is inferred and requires verification.
-                              </div>
-                            </div>
-
-                            {/* Feature Category 4: Slots */}
-                            <div className="p-4 rounded-lg bg-slate-950 border border-slate-800 space-y-2 flex flex-col justify-between">
-                              <div className="space-y-1.5">
-                                <div className="flex items-center justify-between gap-2">
-                                  <span className="font-mono font-bold text-slate-100">
-                                    Slots &amp; Keyways
-                                  </span>
-                                  <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-950/80 text-amber-300 border border-amber-800">
-                                    Requires Verification
-                                  </span>
-                                </div>
-                                <p className="text-slate-300 text-[11px] leading-relaxed">
-                                  No standalone closed oblong slots or keyways are independently parameterized from the surface geometry.
+                              ) : (
+                                <p className="text-slate-400 text-[11px]">
+                                  No internal cylindrical holes detected in the 3D mesh.
                                 </p>
-                              </div>
-                              <div className="pt-2 border-t border-slate-800/80 text-[11px] text-slate-400 font-mono">
-                                <span className="text-amber-300 font-semibold">Requires Verification: </span>
-                                Oblong holes, open slots, or keyways share planar and partial-arc surfaces; confirm any slot width/length tolerances directly against the 2D engineering drawing.
-                              </div>
+                              )}
                             </div>
+                            <div className="pt-2 border-t border-slate-800/80 text-[11px] text-slate-400 font-mono">
+                              <span className="text-amber-300 font-semibold">Predicted / Assumed: </span>
+                              Diameter &amp; axial span are measured from the 3D mesh; internal threads or H7 reaming tolerances are not in the 3D geometry and are predicted when estimating finishing operations.
+                            </div>
+                          </div>
 
-                            {/* Feature Category 5: Fillets and Chamfers */}
-                            <div className="p-4 rounded-lg bg-slate-950 border border-slate-800 space-y-2 flex flex-col justify-between">
-                              <div className="space-y-1.5">
-                                <div className="flex items-center justify-between gap-2">
-                                  <span className="font-mono font-bold text-slate-100">
-                                    Fillets &amp; Chamfers
-                                  </span>
-                                  <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-sky-950/90 text-sky-300 border border-sky-800">
-                                    {chamferFeatures.length + filletFeatures.length > 0
-                                      ? `${chamferFeatures.length} Chamfer(s) · ${filletFeatures.length} Fillet(s)`
-                                      : 'Requires Verification'}
-                                  </span>
-                                </div>
-                                {chamferFeatures.length + filletFeatures.length > 0 ? (
-                                  <div className="space-y-1 font-mono text-[11px] text-slate-200 pt-1">
-                                    {[...chamferFeatures, ...filletFeatures].slice(0, 3).map((cf) => (
-                                      <div
-                                        key={cf.id}
-                                        className="flex items-center justify-between bg-slate-900/80 px-2.5 py-1 rounded border border-slate-800/80"
-                                      >
-                                        <span className="text-amber-300 font-semibold">{cf.id}</span>
-                                        <span>
-                                          {cf.type === 'chamfer'
-                                            ? `Bevel ${(cf.chamferWidthMm || 0).toFixed(2)} mm × ${(cf.chamferAngleDeg || 45).toFixed(1)}°`
-                                            : `Fillet R${(cf.radiusMm || cf.chamferWidthMm || 0).toFixed(2)} mm`}
-                                        </span>
-                                      </div>
-                                    ))}
+                          {/* Card 2: External Cylindrical Sections, Bosses & Planar Datums */}
+                          <div className="p-4 rounded-lg bg-slate-950 border border-slate-800 space-y-2 flex flex-col justify-between">
+                            <div className="space-y-1.5">
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="font-mono font-bold text-slate-100">
+                                  Outer Diameters, Bosses &amp; Faces
+                                </span>
+                                <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-sky-950/90 text-sky-300 border border-sky-800">
+                                  {bossFeatures.length} Cylindrical · {planarFeatures.length} Planar
+                                </span>
+                              </div>
+                              <div className="space-y-1 font-mono text-[11px] text-slate-200 pt-1">
+                                {bossFeatures.slice(0, 2).map((b) => (
+                                  <div
+                                    key={b.id}
+                                    className="flex items-center justify-between bg-slate-900/80 px-2.5 py-1 rounded border border-slate-800/80"
+                                  >
+                                    <span className="text-emerald-300 font-semibold">{b.id}</span>
+                                    <span>
+                                      Outer Ø{(b.diameterMm || 0).toFixed(2)} mm × {(b.depthOrLengthMm || 0).toFixed(2)} mm
+                                    </span>
                                   </div>
-                                ) : (
-                                  <p className="text-slate-300 text-[11px] leading-relaxed">
-                                    No large modeled chamfers or transition fillets isolated; standard edge breaks may be unmodeled.
-                                  </p>
+                                ))}
+                                {planarFeatures.slice(0, 2).map((p) => (
+                                  <div
+                                    key={p.id}
+                                    className="flex items-center justify-between bg-slate-900/80 px-2.5 py-1 rounded border border-slate-800/80"
+                                  >
+                                    <span className="text-sky-300 font-semibold">{p.id}</span>
+                                    <span>
+                                      Planar Datum ({p.areaMm2.toFixed(0)} mm²)
+                                    </span>
+                                  </div>
+                                ))}
+                                {chamferFeatures.length + filletFeatures.length > 0 && (
+                                  <div className="text-[10px] text-slate-400 pt-0.5">
+                                    + {chamferFeatures.length} chamfer(s) and {filletFeatures.length} fillet(s) detected on 3D edges
+                                  </div>
                                 )}
                               </div>
-                              <div className="pt-2 border-t border-slate-800/80 text-[11px] text-slate-400 font-mono">
-                                <span className="text-amber-300 font-semibold">Verification Note: </span>
-                                Inferred transition blends and bevel strips; general edge-break requirements (e.g., 0.5 × 45° deburr) require drawing note verification.
+                            </div>
+                            <div className="pt-2 border-t border-slate-800/80 text-[11px] text-slate-400 font-mono">
+                              <span className="text-amber-300 font-semibold">Predicted / Assumed: </span>
+                              Outer diameters and planar areas are measured from the 3D model; datum priority (A/B/C) and bearing/mating surface finish (Ra) are engineering predictions.
+                            </div>
+                          </div>
+
+                          {/* Card 3: Specifications Predicted / Assumed (Not in 3D CAD Geometry) */}
+                          <div className="p-4 rounded-lg bg-slate-950 border border-amber-800/60 space-y-2 flex flex-col justify-between">
+                            <div className="space-y-1.5">
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="font-mono font-bold text-slate-100">
+                                  Specifications Not in 3D CAD
+                                </span>
+                                <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-950/80 text-amber-300 border border-amber-800">
+                                  Predicted / Assumed
+                                </span>
+                              </div>
+                              <div className="space-y-1 font-mono text-[11px] text-slate-300 pt-1">
+                                {report.missingManufacturingSpecifications.map((spec) => (
+                                  <div
+                                    key={spec.attribute}
+                                    className="flex items-center justify-between bg-slate-900/80 px-2.5 py-1 rounded border border-slate-800/80"
+                                  >
+                                    <span className="truncate pr-2">{spec.attribute}</span>
+                                    <span
+                                      className={`text-[10px] font-bold shrink-0 ${
+                                        spec.status === 'SPECIFIED IN CAD'
+                                          ? 'text-emerald-300'
+                                          : 'text-amber-300'
+                                      }`}
+                                    >
+                                      {spec.status === 'SPECIFIED IN CAD'
+                                        ? 'In CAD Metadata'
+                                        : 'Predicted / Assumed'}
+                                    </span>
+                                  </div>
+                                ))}
                               </div>
                             </div>
-
-                            {/* Feature Category 6: Manufacturing Attributes Requiring Verification */}
-                            <div className="p-4 rounded-lg bg-slate-950 border border-slate-800 space-y-2 flex flex-col justify-between">
-                              <div className="space-y-1.5">
-                                <div className="flex items-center justify-between gap-2">
-                                  <span className="font-mono font-bold text-slate-100">
-                                    PMI, Tolerances &amp; Material
-                                  </span>
-                                  <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-950/80 text-amber-300 border border-amber-800">
-                                    Requires Verification
-                                  </span>
-                                </div>
-                                <div className="space-y-1 font-mono text-[11px] text-slate-300 pt-1">
-                                  {report.missingManufacturingSpecifications.map((spec) => (
-                                    <div
-                                      key={spec.attribute}
-                                      className="flex items-center justify-between bg-slate-900/80 px-2.5 py-1 rounded border border-slate-800/80"
-                                    >
-                                      <span className="truncate pr-2">{spec.attribute}</span>
-                                      <span
-                                        className={`text-[10px] font-bold shrink-0 ${
-                                          spec.status === 'SPECIFIED IN CAD'
-                                            ? 'text-emerald-300'
-                                            : 'text-amber-300'
-                                        }`}
-                                      >
-                                        {spec.status === 'SPECIFIED IN CAD'
-                                          ? 'Extracted'
-                                          : 'Requires Verification'}
-                                      </span>
-                                    </div>
-                                  ))}
-                                </div>
-                              </div>
-                              <div className="pt-2 border-t border-slate-800/80 text-[11px] text-slate-400 font-mono">
-                                <span className="text-amber-300 font-semibold">Zero Invented Specifications: </span>
-                                Unspecified material grades, GD&amp;T tolerances, and surface finishes are never invented as CAD facts; baseline assumptions are editable in the Cost Model.
-                              </div>
+                            <div className="pt-2 border-t border-slate-800/80 text-[11px] text-slate-400 font-mono">
+                              <span className="text-amber-300 font-semibold">Engineering Transparency: </span>
+                              Whenever material grade, tolerances, or surface finishes are not stored inside the 3D CAD file, we predict a standard industrial baseline and let you edit it in Stage 6.
                             </div>
                           </div>
                         </div>
+
+                        {/* 3. 3D Spatial Relationships Between Features (Coaxiality, Bore Pitch, Datum Perpendicularity & Wall Thickness) */}
+                        {report.spatialRelationships && report.spatialRelationships.length > 0 && (
+                          <div className="p-4 rounded-lg bg-slate-950 border border-slate-800 space-y-2 text-xs">
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <span className="font-mono font-bold uppercase tracking-wider text-sky-400">
+                                3D Spatial Relationships Between Features (Measured from 3D Geometry)
+                              </span>
+                              <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-emerald-950 text-emerald-300 border border-emerald-800">
+                                3D Spatial Topology
+                              </span>
+                            </div>
+                            <ul className="space-y-1.5 text-slate-300 font-mono text-[11px]">
+                              {report.spatialRelationships.map((rel, rIdx) => (
+                                <li key={rIdx} className="leading-relaxed">
+                                  • {rel}
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
                       </section>
                     );
                   })()}
@@ -1457,7 +1396,20 @@ export default function App() {
                     </div>
 
                     <div>
-                      <div className="text-xs font-mono text-slate-400">Material (CAD Metadata)</div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-mono text-slate-400">Material &amp; Engineering Specification</span>
+                        <span
+                          className={`px-1.5 py-0.5 rounded text-[10px] font-mono font-bold ${
+                            currentVersion.description.materialSpecification.source === 'CAD Header Metadata'
+                              ? 'bg-emerald-950 text-emerald-300 border border-emerald-800'
+                              : 'bg-amber-950 text-amber-300 border border-amber-800'
+                          }`}
+                        >
+                          {currentVersion.description.materialSpecification.source === 'CAD Header Metadata'
+                            ? 'Extracted from CAD Metadata'
+                            : 'Predicted / Assumed (Not in 3D CAD)'}
+                        </span>
+                      </div>
                       <div className="font-mono text-slate-100 font-medium mt-0.5">
                         {currentVersion.description.materialSpecification.value}
                       </div>
@@ -1525,7 +1477,25 @@ export default function App() {
                         {currentVersion.bom.entries.map((entry) => (
                           <tr key={`summary-${entry.itemNumber}`} className="hover:bg-slate-800/40 align-top">
                             <td className="py-3 px-4 font-semibold text-slate-100">
-                              {entry.componentName}
+                              <div>{entry.componentName}</div>
+                              <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                                <span
+                                  className={`inline-block text-[10px] font-mono px-1.5 py-0.5 rounded border ${
+                                    entry.componentSourceType === 'PURCHASED_STANDARD_CATALOG'
+                                      ? 'bg-sky-950/80 border-sky-700/70 text-sky-300'
+                                      : 'bg-amber-950/70 border-amber-700/60 text-amber-300'
+                                  }`}
+                                >
+                                  {entry.componentSourceType === 'PURCHASED_STANDARD_CATALOG'
+                                    ? 'PURCHASED CATALOG ITEM'
+                                    : 'CUSTOM MANUFACTURED'}
+                                </span>
+                                {entry.quantity > 1 && (
+                                  <span className="inline-block text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 text-slate-200">
+                                    Qty: {entry.quantity} pcs
+                                  </span>
+                                )}
+                              </div>
                             </td>
                             <td className="py-3 px-4 font-mono text-amber-300">
                               {entry.material}
@@ -1556,7 +1526,7 @@ export default function App() {
                           <th className="py-2.5 px-3 text-right">Density</th>
                           <th className="py-2.5 px-3">Primary Manufacturing Process</th>
                           <th className="py-2.5 px-3">Secondary Finishing Operations</th>
-                          <th className="py-2.5 px-3">Finishing Envelope</th>
+                          <th className="py-2.5 px-3">Unit Envelope</th>
                           <th className="py-2.5 px-3 min-w-[260px]">
                             Raw Material → Net Volume Conversion (m³ &amp; cm³)
                           </th>
@@ -1571,7 +1541,20 @@ export default function App() {
                         {currentVersion.bom.entries.map((entry) => (
                           <tr key={entry.itemNumber} className="hover:bg-slate-800/40 align-top">
                             <td className="py-3 px-3 font-semibold text-slate-100 min-w-[140px]">
-                              {entry.componentName}
+                              <div>{entry.componentName}</div>
+                              <div className="mt-1">
+                                <span
+                                  className={`inline-block text-[9px] font-mono px-1.5 py-0.5 rounded border ${
+                                    entry.componentSourceType === 'PURCHASED_STANDARD_CATALOG'
+                                      ? 'bg-sky-950/80 border-sky-700/70 text-sky-300'
+                                      : 'bg-amber-950/70 border-amber-700/60 text-amber-300'
+                                  }`}
+                                >
+                                  {entry.componentSourceType === 'PURCHASED_STANDARD_CATALOG'
+                                    ? 'PURCHASED CATALOG'
+                                    : 'CUSTOM MACHINED'}
+                                </span>
+                              </div>
                             </td>
                             <td className="py-3 px-3 text-slate-300 min-w-[140px]">
                               {entry.structuralRole}
@@ -1595,19 +1578,31 @@ export default function App() {
                               {entry.secondaryOperations}
                             </td>
                             <td className="py-3 px-3 font-mono text-slate-200 whitespace-nowrap tabular-nums">
-                              {entry.boundingBoxMm}
+                              <div>{entry.boundingBoxMm}</div>
+                              {entry.quantity > 1 && (
+                                <div className="text-[10px] text-slate-400">
+                                  (Per unit · {entry.quantity}× instances)
+                                </div>
+                              )}
                             </td>
                             <td className="py-3 px-3 text-slate-200 leading-relaxed">
                               <div className="font-mono font-semibold text-emerald-300 whitespace-nowrap tabular-nums">
                                 {entry.rawVolumeM3.toFixed(6)} m³ → {entry.netVolumeM3.toFixed(6)} m³ ({entry.volumeCm3.toFixed(3)} cm³)
                               </div>
+                              {entry.quantity > 1 && entry.unitVolumeCm3 !== undefined && (
+                                <div className="text-[10px] font-mono text-sky-300 mt-0.5">
+                                  Unit Vol: {entry.unitVolumeCm3.toFixed(3)} cm³ × {entry.quantity} pcs = {entry.volumeCm3.toFixed(3)} cm³
+                                </div>
+                              )}
                               <div className="text-[11px] text-slate-400 mt-1">
                                 {entry.volumeConversionExplanation}
                               </div>
                             </td>
                             <td className="py-3 px-3 text-slate-200 leading-relaxed">
                               <div className="font-mono font-bold text-amber-300 tabular-nums">
-                                {entry.chipRemovalRatioPct.toFixed(1)}% Chip Removal
+                                {entry.componentSourceType === 'PURCHASED_STANDARD_CATALOG'
+                                  ? '0.0% Chip Removal (Purchased OEM/ISO Item)'
+                                  : `${entry.chipRemovalRatioPct.toFixed(1)}% Chip Removal`}
                               </div>
                               <div className="text-[11px] text-slate-400 mt-1">
                                 {entry.chipRemovalExplanation}
@@ -1622,7 +1617,7 @@ export default function App() {
                             <td className="py-3 px-3 text-right font-mono font-semibold text-slate-100 whitespace-nowrap tabular-nums">
                               <div>{(entry.estimatedMassGrams / 1000).toFixed(3)} kg</div>
                               <div className="text-[10px] text-slate-400">
-                                ({entry.estimatedMassGrams.toFixed(1)} g)
+                                ({entry.estimatedMassGrams.toFixed(1)} g{entry.quantity > 1 && entry.unitEstimatedMassGrams ? ` · ${entry.unitEstimatedMassGrams.toFixed(1)} g/pc` : ''})
                               </div>
                             </td>
                           </tr>
@@ -1980,30 +1975,14 @@ export default function App() {
                   ? Math.max(0, +(v1Cost.totalUnitCostEur - currentCost.totalUnitCostEur).toFixed(2))
                   : 0;
 
-              const activeOpp =
-                ce.costReductionOpportunities.find((o) => o.id === selectedCostOpportunityId) ||
-                ce.costReductionOpportunities.find(
-                  (o) => o.linkedFeatureId === costSelectedFeatureId
-                ) ||
-                ce.costReductionOpportunities[0] ||
-                null;
-              const activeCostFeatId =
-                activeOpp?.linkedFeatureId ||
-                costSelectedFeatureId ||
-                selectedFeatureId;
-
               const appliedMods = currentVersion.modificationHistory.filter(
                 (m) => m.status === 'applied'
               );
               const lastModRecord =
                 appliedMods.length > 0 ? appliedMods[appliedMods.length - 1] : null;
-              const lastModFeatureId = lastModRecord?.targetFeatureId
-                ? lastModRecord.targetFeatureId.split('→').pop()!.split(',')[0].trim()
-                : null;
 
               const vr = ce.validationReport;
               const ctb = ce.cycleTimeBreakdown;
-              const combinedDfm = ce.combinedDfmScenario;
               const selectedRouteKey = ce.selectedProcessRouteKey || 'BILLET_CNC';
               const selectedBatchSize = ce.batchSize || 10;
               const selectedRouteLabel =
@@ -2042,16 +2021,16 @@ export default function App() {
                         {vr && (
                           <span
                             className={`px-2 py-0.5 text-[11px] font-mono font-bold rounded border ${
-                              vr.overallStatus === 'VALIDATED'
-                                ? 'bg-emerald-950 text-emerald-300 border-emerald-700'
-                                : vr.overallStatus === 'VALIDATED_WITH_ASSUMPTIONS'
-                                ? 'bg-sky-950 text-sky-300 border-sky-700'
-                                : 'bg-rose-950 text-rose-300 border-rose-700'
+                              vr.overallStatus === 'ENGINEERING_REVIEW_REQUIRED' ||
+                              vr.overallStatus === 'DISCREPANCY_DETECTED'
+                                ? 'bg-rose-950 text-rose-300 border-rose-700'
+                                : 'bg-sky-950 text-sky-300 border-sky-700'
                             }`}
                           >
-                            {vr.overallStatus === 'ENGINEERING_REVIEW_REQUIRED'
+                            {vr.overallStatus === 'ENGINEERING_REVIEW_REQUIRED' ||
+                            vr.overallStatus === 'DISCREPANCY_DETECTED'
                               ? 'Engineering Review Required'
-                              : vr.overallStatus.replace(/_/g, ' ')}
+                              : 'Arithmetic Reconciled · Preliminary Assumptions Disclosed'}
                           </span>
                         )}
                       </div>
@@ -2088,26 +2067,61 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* 1. AUTOMATIC ARITHMETIC & CAD-TO-COST VALIDATION LAYER */}
-                  {vr && (
-                    <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <div className="flex items-center gap-2">
-                          <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                          <span className="text-xs font-mono font-bold uppercase tracking-wider text-emerald-400">
-                            Automatic CAD-to-Cost Arithmetic &amp; Consistency Validation Layer
-                          </span>
-                        </div>
-                        <span className="text-[11px] font-mono text-slate-400">
-                          Volume Sync: Stage 1B ({vr.authoritativeVolumeCm3} cm³) = Stage 4 BOM ({vr.bomTotalVolumeCm3} cm³) = Stage 3 Dim ({vr.dimensionTableVolumeCm3} cm³)
+                  {/* 1. MEASURED 3D GEOMETRY vs. RECONCILED ARITHMETIC vs. PRELIMINARY ASSUMPTIONS */}
+                  <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                        <span className="text-xs font-mono font-bold uppercase tracking-wider text-emerald-400">
+                          3D Measured Geometry vs. Reconciled Arithmetic vs. Preliminary Engineering Assumptions
                         </span>
                       </div>
+                      {vr && (
+                        <span className="text-[11px] font-mono text-slate-400">
+                          3D Solid Volume Sync: Stage 1B ({vr.authoritativeVolumeCm3} cm³) = Stage 4 BOM ({vr.bomTotalVolumeCm3} cm³)
+                        </span>
+                      )}
+                    </div>
 
-                      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-2.5 text-xs font-mono">
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs leading-relaxed">
+                      <div className="p-3 rounded-lg bg-slate-900/90 border border-emerald-800/60">
+                        <div className="font-mono font-bold text-emerald-300 uppercase text-[11px] mb-1">
+                          1. Measured 3D Geometry &amp; Reconciled Arithmetic
+                        </div>
+                        <p className="text-slate-300">
+                          • <span className="font-semibold text-slate-100">3D Solid Volume &amp; Envelope:</span> Net part volume ({authVolumeCm3.toFixed(3)} cm³) and overall bounding dimensions are measured directly from the 3D CAD mesh.<br />
+                          • <span className="font-semibold text-slate-100">Aligned BOM &amp; Costing Raw Stock:</span> Both BOM and Costing use the exact same raw stock blank ({ce.stockValidation?.stockDimensionsFormatted || currentVersion.bom.entries[0]?.rawStockDimensionsMm}), and mass conservation (<span className="font-mono">m_raw − m_net = m_swarf</span>) is mathematically reconciled.<br />
+                          • <span className="font-semibold text-slate-100">Equation Reconciliation:</span> Every operation cost equation reconciles to the component cost, and the sum of BOM components equals the final part cost.
+                        </p>
+                      </div>
+
+                      <div className="p-3 rounded-lg bg-slate-900/90 border border-amber-800/60">
+                        <div className="font-mono font-bold text-amber-300 uppercase text-[11px] mb-1">
+                          2. Preliminary Engineering Assumptions Requiring Review (Editable Below)
+                        </div>
+                        <p className="text-slate-300">
+                          • Internal arithmetic reconciliation does not replace a production CAM toolpath or 2D drawing review. <span className="font-semibold text-slate-100">Material alloy</span> (when not in CAD metadata), <span className="font-semibold text-slate-100">parametric cycle times</span> (MRR &amp; surface area rates), <span className="font-semibold text-slate-100">batch size ({selectedBatchSize} pcs)</span>, and <span className="font-semibold text-slate-100">Sweden shop rates</span> are preliminary engineering assumptions.<br />
+                          • Adjust any parameter in the editor below to immediately recalculate all BOM and costing equations.
+                        </p>
+                      </div>
+                    </div>
+
+                    {vr && (
+                      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-2.5 text-xs font-mono pt-1">
                         {vr.validationMatrix
-                          .filter((chk) => chk.checkId !== 'CHK-KERNEL')
+                          .filter((chk) => chk.checkId !== 'CHK-KERNEL' && chk.checkId !== 'CHK-DFM')
                           .map((chk) => {
                             const isPass = chk.status !== 'DISCREPANCY_DETECTED';
+                            const badgeText =
+                              chk.status === 'ARITHMETIC_PASSED'
+                                ? 'ARITHMETIC RECONCILED'
+                                : chk.status === 'VERIFIED'
+                                  ? '3D / METADATA SYNCED'
+                                  : chk.status === 'ASSUMED_BASELINE' || chk.status === 'MESH_APPROXIMATION'
+                                    ? 'PRELIMINARY ASSUMPTION'
+                                    : chk.status === 'USER_OVERRIDDEN'
+                                      ? 'USER OVERRIDDEN'
+                                      : 'REVIEW REQUIRED';
                             return (
                               <div
                                 key={chk.checkId}
@@ -2130,7 +2144,7 @@ export default function App() {
                                         : 'bg-rose-950 text-rose-300 border border-rose-800'
                                     }`}
                                   >
-                                    {chk.status.replace(/_/g, ' ')}
+                                    {badgeText}
                                   </span>
                                 </div>
                                 <div className="text-[10px] text-slate-400">
@@ -2146,8 +2160,8 @@ export default function App() {
                             );
                           })}
                       </div>
-                    </div>
-                  )}
+                    )}
+                  </div>
 
                   {/* 2. INTERACTIVE COSTING ASSUMPTIONS & PROCESS ROUTE EDITOR */}
                   <div className="p-4 rounded-xl bg-slate-950 border border-amber-500/40 space-y-3">
@@ -2465,19 +2479,19 @@ export default function App() {
                     </div>
                   )}
 
-                  {/* 4. PHYSICS- & PROCESS-BASED CYCLE TIME BREAKDOWN */}
+                  {/* 4. PRELIMINARY PARAMETRIC CYCLE-TIME BREAKDOWN */}
                   {ctb && (
                     <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2.5 text-xs font-mono">
                       <div className="flex flex-wrap items-center justify-between gap-2">
                         <span className="font-bold uppercase tracking-wider text-sky-400">
-                          Physics- &amp; Process-Based Cycle Time Derivation ({ctb.totalMachiningCycleTimeMin.toFixed(2)} min/pc + {ctb.setupTimeAmortizedPerPieceMin.toFixed(2)} min amortized setup)
+                          Preliminary Parametric Cycle-Time Estimate — CAM Toolpath Verification Required ({ctb.totalMachiningCycleTimeMin.toFixed(2)} min/pc + {ctb.setupTimeAmortizedPerPieceMin.toFixed(2)} min amortized setup)
                         </span>
                         <span className="text-slate-400 text-[11px]">
                           v_c = {ctb.cuttingSpeedVcMPerMin} m/min · RPM = {ctb.effectiveSpindleRpm} · f_z = {ctb.feedPerToothFzMm} mm/tooth · Tool Changes = {ctb.toolChangeCount}
                         </span>
                       </div>
                       <div className="p-2.5 rounded bg-slate-900 border border-slate-800 text-amber-300 text-[11px] overflow-x-auto">
-                        {ctb.explicitCycleTimeEquation}
+                        {ctb.explicitCycleTimeEquation} (Preliminary MRR &amp; surface-area estimate — verify with CAM toolpath simulation)
                       </div>
                       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 text-[11px]">
                         <div className="p-2 rounded bg-slate-900/70 border border-slate-800">
@@ -2568,24 +2582,56 @@ export default function App() {
                       >
                         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-3">
                           <div>
-                            <div className="text-xs font-mono text-amber-400 uppercase">
-                              BOM Component #{comp.itemNumber} (Qty: {comp.quantity} · Per-Piece Calculation)
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="text-xs font-mono text-amber-400 uppercase">
+                                BOM Component #{comp.itemNumber} (Qty: {comp.quantity} · Assembly Contribution)
+                              </span>
+                              <span
+                                className={`text-[10px] font-mono px-2 py-0.5 rounded border ${
+                                  comp.componentSourceType === 'PURCHASED_STANDARD_CATALOG'
+                                    ? 'bg-sky-950/80 border-sky-700/70 text-sky-300'
+                                    : 'bg-amber-950/70 border-amber-700/60 text-amber-300'
+                                }`}
+                              >
+                                {comp.componentSourceType === 'PURCHASED_STANDARD_CATALOG'
+                                  ? 'PURCHASED CATALOG ALLOWANCE (ASSUMED — REQUIRES VENDOR QUOTE)'
+                                  : 'CUSTOM MANUFACTURED COMPONENT'}
+                              </span>
                             </div>
                             <h3 className="text-base font-bold text-slate-100 mt-0.5">
                               {comp.componentName}
                             </h3>
                             <div className="text-xs font-mono text-slate-400 mt-0.5">
-                              Material: <span className="text-slate-200">{comp.material}</span> · Raw Input:{' '}
-                              <span className="text-slate-200">{comp.rawMassKg.toFixed(4)} kg</span> → Net Mass:{' '}
-                              <span className="text-emerald-300">{comp.netMassKg.toFixed(4)} kg</span> (Scrap/Swarf:{' '}
-                              <span className="text-amber-300">{Math.max(0, comp.rawMassKg - comp.netMassKg).toFixed(4)} kg</span>)
+                              Material: <span className="text-slate-200">{comp.material}</span> ·{' '}
+                              {comp.componentSourceType === 'PURCHASED_STANDARD_CATALOG' ? (
+                                <>
+                                  Catalog Mass (Qty {comp.quantity}):{' '}
+                                  <span className="text-emerald-300">{comp.netMassKg.toFixed(4)} kg</span> (No Billet Machining Swarf)
+                                </>
+                              ) : (
+                                <>
+                                  Raw Input (Qty {comp.quantity}):{' '}
+                                  <span className="text-slate-200">{comp.rawMassKg.toFixed(4)} kg</span> → Net Mass:{' '}
+                                  <span className="text-emerald-300">{comp.netMassKg.toFixed(4)} kg</span> (Scrap/Swarf:{' '}
+                                  <span className="text-amber-300">{Math.max(0, comp.rawMassKg - comp.netMassKg).toFixed(4)} kg</span>)
+                                </>
+                              )}
                             </div>
                           </div>
                           <div className="text-right font-mono">
-                            <div className="text-[11px] text-slate-400 uppercase">Scenario-Based Component Total / Piece</div>
+                            <div className="text-[11px] text-slate-400 uppercase">
+                              {comp.quantity > 1
+                                ? `Extended Component Total (${comp.quantity} pcs)`
+                                : 'Scenario-Based Component Total / Piece'}
+                            </div>
                             <div className="text-base font-bold text-amber-300">
                               {comp.totalComponentCostSek.toFixed(2)} SEK (€{comp.totalComponentCostEur.toFixed(2)})
                             </div>
+                            {comp.quantity > 1 && (
+                              <div className="text-[11px] text-sky-300">
+                                {(comp.totalComponentCostSek / comp.quantity).toFixed(2)} SEK / pc × {comp.quantity} pcs
+                              </div>
+                            )}
                           </div>
                         </div>
 
@@ -2662,292 +2708,71 @@ export default function App() {
                     ))}
                   </div>
 
-                  {/* 6. DFM OPPORTUNITIES AS ENGINEERING HYPOTHESES */}
-                  <div className="bg-slate-950 border border-slate-800 rounded-xl p-5 space-y-5">
-                    <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-3">
+                  {/* 6. FINAL PART COST ROLL-UP FROM BOM COMPONENTS */}
+                  <div className="p-5 rounded-xl bg-slate-950 border border-amber-500/50 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-2.5">
                       <div>
-                        <div className="flex items-center gap-2">
-                          <h3 className="text-base font-bold text-slate-100 font-display">
-                            DFM Opportunities as Engineering Hypotheses
-                          </h3>
-                          <span className="px-2 py-0.5 text-[10px] font-mono font-bold uppercase bg-amber-500/15 text-amber-300 border border-amber-500/30 rounded">
-                            Engineering Hypotheses · Validation Required
-                          </span>
-                        </div>
-                        <p className="text-xs font-mono text-slate-400 mt-0.5">
-                          Candidate design and manufacturing hypotheses derived from part geometry. Presented for engineering review and manufacturing validation rather than guaranteed cost reductions.
+                        <span className="text-xs font-mono font-bold uppercase tracking-wider text-amber-400">
+                          Final Part Cost Summary (Calculated from BOM Components)
+                        </span>
+                        <p className="text-[11px] font-mono text-slate-400 mt-0.5">
+                          Each BOM component&apos;s manufacturing process cost is summed to establish the final per-piece part cost
                         </p>
                       </div>
-                      <span className="px-3 py-1.5 text-xs font-mono text-sky-300 bg-sky-950/60 border border-sky-800/70 rounded-lg">
-                        Requires Design, Tolerance &amp; Process Qualification
+                      <span className="px-2.5 py-1 text-xs font-mono font-bold bg-emerald-950 text-emerald-300 border border-emerald-800 rounded">
+                        Verified Component-to-Part Rollup
                       </span>
                     </div>
 
-                    <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-                      {/* Left: DFM Engineering Hypotheses */}
-                      <div className="lg:col-span-5 space-y-3">
-                        <div className="flex items-center justify-between">
-                          <span className="text-xs font-mono font-bold uppercase tracking-wider text-amber-400">
-                            Engineering Hypotheses (Click to Preview in 3D)
-                          </span>
-                          <span className="text-[11px] font-mono text-slate-400">
-                            {ce.costReductionOpportunities.length} candidate hypotheses
-                          </span>
-                        </div>
-
-                        {ce.costReductionOpportunities.map((opp) => {
-                          const isSelected = activeOpp?.id === opp.id;
-                          const featureConsiderationText =
-                            opp.featureOrConsideration || opp.locationOn3dModel;
-                          const proposedHypothesisText =
-                            opp.proposedHypothesis || opp.recommendation;
-                          const rationaleText =
-                            opp.manufacturabilityOrCostRationale || opp.currentCostDriver;
-                          const constraintsText =
-                            opp.functionalOrManufacturingConstraints ||
-                            'Modifying this feature requires evaluating minimum wall thickness, bearing journal or cam profile function, assembly interfaces, and mating clearances.';
-                          const validationText =
-                            opp.engineeringValidationRequired ||
-                            (opp.unverifiedDesignConstraints
-                              ? opp.unverifiedDesignConstraints.replace(
-                                  /^Constraint Verification Required:\s*/i,
-                                  ''
-                                )
-                              : 'Confirm functional clearance, structural wall thickness, mating tolerance stack-up, and customer drawing specifications before implementing.');
-
-                          return (
-                            <div
-                              key={opp.id}
-                              onClick={() => {
-                                setSelectedCostOpportunityId(opp.id);
-                                if (opp.linkedFeatureId) setCostSelectedFeatureId(opp.linkedFeatureId);
-                              }}
-                              className={`p-3.5 rounded-xl border transition-all cursor-pointer space-y-2.5 ${
-                                isSelected
-                                  ? 'bg-emerald-950/30 border-emerald-500/80 shadow-sm'
-                                  : 'bg-slate-900 border-slate-800 hover:border-slate-700'
-                              }`}
-                            >
-                              <div className="flex items-center justify-between gap-2">
-                                <span className="px-2 py-0.5 text-[10px] font-mono font-bold uppercase bg-sky-500/15 text-sky-300 border border-sky-500/30 rounded">
-                                  Hypothesis #{opp.strategyNumber} · {opp.strategyCategory}
-                                </span>
-                                <span className="px-2 py-0.5 text-[10px] font-mono font-semibold bg-amber-500/15 text-amber-300 border border-amber-500/30 rounded shrink-0">
-                                  Engineering Hypothesis
-                                </span>
-                              </div>
-
-                              <div className="text-xs font-bold text-slate-100 leading-snug">
-                                {opp.title}
-                              </div>
-
-                              <div className="space-y-2 text-xs pt-0.5">
-                                <div className="text-slate-200 leading-relaxed">
-                                  <span className="font-mono font-semibold text-amber-300">
-                                    Feature or manufacturing consideration:{' '}
-                                  </span>
-                                  {featureConsiderationText}
-                                </div>
-
-                                <div className="text-slate-200 leading-relaxed">
-                                  <span className="font-mono font-semibold text-emerald-300">
-                                    Proposed engineering hypothesis:{' '}
-                                  </span>
-                                  {proposedHypothesisText}
-                                </div>
-
-                                <div className="text-slate-300 leading-relaxed">
-                                  <span className="font-mono font-semibold text-sky-300">
-                                    Why it might improve manufacturability or cost:{' '}
-                                  </span>
-                                  {rationaleText}
-                                </div>
-
-                                <div className="p-2 rounded-lg bg-slate-950/90 border border-slate-800 text-[11px] text-slate-300 leading-relaxed">
-                                  <span className="font-mono text-emerald-300 font-semibold">
-                                    Functional or manufacturing constraints:{' '}
-                                  </span>
-                                  {constraintsText}
-                                </div>
-
-                                <div className="p-2 rounded-lg bg-amber-950/35 border border-amber-800/70 text-[11px] text-amber-200 leading-relaxed">
-                                  <span className="font-mono font-bold text-amber-300">
-                                    Engineering validation required:{' '}
-                                  </span>
-                                  {validationText}
-                                </div>
-                              </div>
-
-                              <div className="pt-1 flex items-center justify-between gap-2">
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    setSelectedCostOpportunityId(opp.id);
-                                    if (opp.linkedFeatureId) {
-                                      setCostSelectedFeatureId(opp.linkedFeatureId);
-                                    }
-                                  }}
-                                  className={`px-2.5 py-1 text-[11px] font-mono rounded border transition-colors cursor-pointer ${
-                                    isSelected
-                                      ? 'bg-emerald-500/20 text-emerald-200 border-emerald-500/50 font-semibold'
-                                      : 'bg-slate-950 hover:bg-slate-800 text-slate-300 border-slate-700'
-                                  }`}
-                                >
-                                  {isSelected ? 'Highlighted on 3D' : 'Show on 3D Model'}
-                                </button>
-
-                                {opp.suggested3dPrompt && (
-                                  <button
-                                    type="button"
-                                    disabled={isModifying}
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      if (opp.linkedFeatureId) {
-                                        setSelectedFeatureId(opp.linkedFeatureId);
-                                        setCostSelectedFeatureId(opp.linkedFeatureId);
-                                      }
-                                      handleExecuteModification(
-                                        opp.suggested3dPrompt!,
-                                        opp.linkedFeatureId,
-                                        {
-                                          opportunityId: opp.id,
-                                          estimatedSavingSek: opp.estimatedSavingSek,
-                                          estimatedSavingEur: opp.estimatedSavingEur,
-                                        }
-                                      );
-                                    }}
-                                    className="px-3 py-1 text-[11px] font-mono font-bold bg-amber-500 hover:bg-amber-400 text-slate-950 rounded cursor-pointer disabled:opacity-50"
-                                  >
-                                    Apply on 3D Model
-                                  </button>
-                                )}
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-
-                      {/* Right: Interactive 3D Model showing Cost-Reduction Zones & Live 3D Preview */}
-                      <div className="lg:col-span-7">
-                        <CadInteractiveViewer
-                          key={`cost-3d-${uploadSessionId}-v${currentVersion.versionNumber}`}
-                          components={currentVersion.components}
-                          features={currentVersion.features}
-                          annotations={currentVersion.annotations}
-                          selectedFeatureId={activeCostFeatId}
-                          onSelectFeature={(fid) => {
-                            setCostSelectedFeatureId(fid);
-                            const matchingOpp = ce.costReductionOpportunities.find(
-                              (o) => o.linkedFeatureId === fid
-                            );
-                            if (matchingOpp) {
-                              setSelectedCostOpportunityId(matchingOpp.id);
-                            }
-                          }}
-                          isolatedComponentIndex={isolatedComponentIndex}
-                          baselineComponents={versions[0]?.components}
-                          versionNumber={currentVersion.versionNumber}
-                          lastModifiedFeatureId={lastModFeatureId}
-                          activePreviewOverlay={activeOpp?.previewGeometry || null}
-                          onApplyActivePreview={
-                            activeOpp?.suggested3dPrompt && !isModifying
-                              ? () =>
-                                  handleExecuteModification(
-                                    activeOpp.suggested3dPrompt!,
-                                    activeOpp.linkedFeatureId,
-                                    {
-                                      opportunityId: activeOpp.id,
-                                      estimatedSavingSek: activeOpp.estimatedSavingSek,
-                                      estimatedSavingEur: activeOpp.estimatedSavingEur,
-                                    }
-                                  )
-                              : undefined
-                          }
-                        />
-                      </div>
+                    <div className="overflow-x-auto border border-slate-800 rounded-lg">
+                      <table className="w-full text-left border-collapse text-xs font-mono">
+                        <thead>
+                          <tr className="bg-slate-900 border-b border-slate-800 text-slate-400">
+                            <th className="py-2 px-3">BOM Item</th>
+                            <th className="py-2 px-3">Component Name</th>
+                            <th className="py-2 px-3">Primary Manufacturing Process</th>
+                            <th className="py-2 px-3 text-right">Qty</th>
+                            <th className="py-2 px-3 text-right">Net Mass</th>
+                            <th className="py-2 px-3 text-right">Component Cost (SEK)</th>
+                            <th className="py-2 px-3 text-right">Component Cost (EUR)</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-800/70">
+                          {ce.componentCostBreakdowns.map((comp) => (
+                            <tr key={`rollup-${comp.itemNumber}`} className="bg-slate-950/60">
+                              <td className="py-2 px-3 text-amber-300 font-semibold">#{comp.itemNumber}</td>
+                              <td className="py-2 px-3 text-slate-100 font-semibold">{comp.componentName}</td>
+                              <td className="py-2 px-3 text-slate-300">{comp.primaryProcess}</td>
+                              <td className="py-2 px-3 text-right text-slate-200 tabular-nums">{comp.quantity}</td>
+                              <td className="py-2 px-3 text-right text-slate-300 tabular-nums">{comp.netMassKg.toFixed(4)} kg</td>
+                              <td className="py-2 px-3 text-right font-semibold text-slate-100 tabular-nums">
+                                {comp.totalComponentCostSek.toFixed(2)} SEK
+                              </td>
+                              <td className="py-2 px-3 text-right text-slate-300 tabular-nums">
+                                €{comp.totalComponentCostEur.toFixed(2)}
+                              </td>
+                            </tr>
+                          ))}
+                          <tr className="bg-amber-500/15 border-t border-amber-500/50 font-bold text-slate-100">
+                            <td colSpan={5} className="py-2.5 px-3 text-right uppercase text-amber-300">
+                              Final Manufacturing Cost of Part ({currentVersion.metadata.fileName} · Per Piece)
+                            </td>
+                            <td className="py-2.5 px-3 text-right text-amber-300 text-sm tabular-nums">
+                              {ce.costBreakdownPerUnit.totalUnitCostSek.toFixed(2)} SEK
+                            </td>
+                            <td className="py-2.5 px-3 text-right text-slate-100 text-sm tabular-nums">
+                              €{ce.costBreakdownPerUnit.totalUnitCostEur.toFixed(2)} EUR
+                            </td>
+                          </tr>
+                        </tbody>
+                      </table>
                     </div>
                   </div>
-
-                  {/* 7. HONEST RATE PROVENANCE & SCOPE TABLE (SWEDEN — SEK & EUR) */}
-                  {ce.rateProvenanceTable && ce.rateProvenanceTable.length > 0 && (
-                    <div className="space-y-2.5">
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <div className="flex items-center gap-1.5 text-xs font-mono font-bold uppercase tracking-wider text-sky-400">
-                          <Globe className="w-3.5 h-3.5 text-sky-400" />
-                          <span>Sweden Rate Provenance, Authority, Date &amp; Scope Audit Table</span>
-                        </div>
-                        <span className="text-[11px] font-mono text-slate-400">
-                          Distinguishes verified live FX, published Swedish industrial benchmarks, engineering assumptions &amp; user overrides
-                        </span>
-                      </div>
-
-                      <div className="overflow-x-auto border border-slate-800 rounded-lg">
-                        <table className="w-full text-left border-collapse text-xs font-mono">
-                          <thead>
-                            <tr className="bg-slate-950 text-slate-400 border-b border-slate-800">
-                              <th className="py-2 px-3">Cost Parameter</th>
-                              <th className="py-2 px-3">Value &amp; Unit</th>
-                              <th className="py-2 px-3">Rate Scope (Operator vs. Machine vs. Material)</th>
-                              <th className="py-2 px-3">Source Authority &amp; Date</th>
-                              <th className="py-2 px-3">Provenance Status</th>
-                            </tr>
-                          </thead>
-                          <tbody className="divide-y divide-slate-800/70">
-                            {ce.rateProvenanceTable.map((row, rIdx) => (
-                              <tr key={rIdx} className="bg-slate-950/60 hover:bg-slate-900">
-                                <td className="py-2 px-3 font-semibold text-slate-100">{row.parameter}</td>
-                                <td className="py-2 px-3 text-amber-300 font-semibold whitespace-nowrap">
-                                  {row.valueFormatted} <span className="text-slate-400 font-normal">({row.unit})</span>
-                                </td>
-                                <td className="py-2 px-3 text-slate-300 text-[11px]">{row.rateScope}</td>
-                                <td className="py-2 px-3 text-slate-400 text-[11px]">
-                                  {row.sourceAuthority} · <span className="text-slate-300">{row.applicableDate}</span>
-                                </td>
-                                <td className="py-2 px-3 whitespace-nowrap">
-                                  <span
-                                    className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                                      row.provenanceType === 'Verified Live FX'
-                                        ? 'bg-emerald-950 text-emerald-300 border border-emerald-800'
-                                        : row.provenanceType === 'User Override'
-                                        ? 'bg-amber-950 text-amber-300 border border-amber-800'
-                                        : row.provenanceType === 'Published Benchmark'
-                                        ? 'bg-sky-950 text-sky-300 border border-sky-800'
-                                        : 'bg-slate-800 text-slate-300 border border-slate-700'
-                                    }`}
-                                  >
-                                    {row.provenanceType}
-                                  </span>
-                                </td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
-
-                      <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5 text-xs font-mono pt-1">
-                        {ce.sources.map((src, idx) => (
-                          <a
-                            key={idx}
-                            href={src.url}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="p-3 rounded-lg bg-slate-950 border border-slate-800 hover:border-sky-500/60 transition-colors block"
-                          >
-                            <div className="font-semibold text-sky-300 truncate">{src.title}</div>
-                            <div className="text-[11px] text-slate-400 mt-1 line-clamp-2">
-                              {src.snippet}
-                            </div>
-                          </a>
-                        ))}
-                      </div>
-                    </div>
-                  )}
                 </section>
               );
             })()}
 
-            {/* PART ENGINEERING & COST AI CHATBOT */}
+            {/* PART ENGINEERING AND COST ASSISTANT */}
             {revealedStageCount >= 6 && (
               <section id="stage-7" className="bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-4">
                 <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-3">
@@ -2955,27 +2780,26 @@ export default function App() {
                     <MessageSquare className="w-5 h-5 text-sky-400" />
                     <div>
                       <h2 className="text-lg font-bold text-slate-100 font-display">
-                        Part Engineering &amp; Cost AI Assistant
+                        Part Engineering and Cost Assistant
                       </h2>
                       <p className="text-xs font-mono text-slate-400">
-                        Ask any question about {currentVersion.metadata.fileName}, its 2D drawings, Consolidated BOM, 3D modifications, or per-piece Sweden manufacturing cost
+                        Ask any question about the {currentVersion.metadata.fileName} part
                       </p>
                     </div>
                   </div>
                   <span className="px-2.5 py-1 text-[11px] font-mono bg-sky-500/15 text-sky-300 border border-sky-500/30 rounded-lg flex items-center gap-1.5">
                     <Sparkles className="w-3.5 h-3.5" />
-                    <span>100% Grounded in Part Geometry</span>
+                    <span>Grounded in 3D Part Geometry</span>
                   </span>
                 </div>
 
                 {/* Quick Engineering Question Chips */}
                 <div className="flex flex-wrap gap-1.5">
                   {[
-                    'Break down the per-piece manufacturing operations cost (raw material, forging, heat treatment, CNC) for this part',
-                    'Explain the raw material to net volume conversion in cubic meters (m³) and chip removal basis',
-                    'Where on the 3D model can we reduce the manufacturing cost per piece?',
-                    'What verified holes, bosses, and planar datum surfaces exist on this part?',
-                    'What manufacturing process is best suited for this part and why?',
+                    `How are the dimensions and volume of ${currentVersion.metadata.fileName} measured from the 3D model?`,
+                    `What specifications are extracted from the 3D CAD model vs. predicted/assumed?`,
+                    `Explain the BOM components and the manufacturing process for each component`,
+                    `How is the final per-piece cost calculated from the BOM components?`,
                   ].map((qChip) => (
                     <button
                       key={qChip}
@@ -3002,7 +2826,7 @@ export default function App() {
                     >
                       <div className="flex items-center justify-between text-[10px] font-mono text-slate-400 mb-1">
                         <span className="font-bold uppercase text-sky-400">
-                          {msg.role === 'user' ? 'Engineer Question' : 'CADSight Part Engineering Assistant'}
+                          {msg.role === 'user' ? 'Engineer Question' : 'Part Engineering and Cost Assistant'}
                         </span>
                         <span>{new Date(msg.timestamp).toLocaleTimeString()}</span>
                       </div>
@@ -3024,7 +2848,7 @@ export default function App() {
                   {isChatLoading && (
                     <div className="p-3 rounded-lg bg-slate-900 border border-slate-800 flex items-center gap-2 text-xs font-mono text-slate-400">
                       <Loader2 className="w-4 h-4 text-sky-400 animate-spin" />
-                      <span>Analyzing 3D part topology, BOM &amp; Sweden cost model...</span>
+                      <span>Analyzing {currentVersion.metadata.fileName} 3D model, BOM &amp; cost calculation...</span>
                     </div>
                   )}
                 </div>
@@ -3041,7 +2865,7 @@ export default function App() {
                     type="text"
                     value={chatInput}
                     onChange={(e) => setChatInput(e.target.value)}
-                    placeholder="Ask anything about this part, its 2D drawings, Consolidated BOM, 3D modifications, or Sweden per-piece cost..."
+                    placeholder={`Ask any question about the ${currentVersion.metadata.fileName} part...`}
                     className="flex-1 bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2.5 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-sky-500"
                   />
                   <button

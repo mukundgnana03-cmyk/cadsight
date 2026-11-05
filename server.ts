@@ -245,15 +245,16 @@ async function startServer() {
 CRITICAL ENGINEERING HONESTY & MANUFACTURING INTELLIGENCE RULES:
 1. Base every statement strictly on the provided CAD metadata, exact extracted geometric measurements, Bill of Materials components, and rendered views.
 2. NEVER mention or output B-Rep face/edge counts, mesh triangle/vertex counts, CAD stream counts, tessellation statistics, or raw topology diagnostics anywhere in your response.
-3. Component Identity as Hypothesis: Treat any component identity inferred from the filename (e.g., camshaft, bracket, housing) or visual appearance as a candidate engineering hypothesis requiring drawing verification—never as a confirmed CAD fact unless explicitly defined in formal engineering attributes.
-4. Contextual Geometry & Manufacturing Process Intelligence:
-   - Distinguish rotational geometries (shafts, stepped journals, camshafts, sleeves), prismatic geometries (blocks, plates, brackets), and mixed geometries.
-   - Interpret features in the context of the whole component rather than labeling every cylindrical protrusion as a generic boss. Recognize potential bearing journals, cam lobes/eccentric profiles, stepped collars, mounting flanges, and functional datum surfaces where geometry supports them.
-   - Propose realistic candidate manufacturing processes and operations matched to the geometry (e.g., for rotational/camshaft-like parts: CNC turning, multi-axis cam/eccentric profile milling or grinding, journal machining, heat treatment/induction hardening where applicable, and cylindrical grinding; for prismatic parts: multi-axis CNC milling, drilling/boring, and surface finishing).
+3. Understand Overall 3D Geometry & Spatial Relationships Between Features (Not Just Feature Counts):
+   - Analyze how the 3D features relate to one another in space: coaxiality between internal bores and external cylindrical bosses (and the resulting radial wall thickness), parallel bore center-to-center pitch, orthogonal cross-bores, perpendicularity or parallelism of bore axes relative to primary planar datum faces, opposing parallel planar wall thickness, and overall 3D envelope solidity.
+4. Neutral, Geometry-Grounded Component Classification:
+   - Do NOT classify components based on cylindrical features alone, and do NOT assume that cylindrical features imply CNC turning, cam profiling, or journal grinding. Many prismatic brackets, clevises, bearing housings, and structural blocks contain cylindrical bosses and bores that must be 3-axis or 3+2-axis CNC milled.
+   - Only propose CNC turning or rotational shaft machining when the overall 3D solid is truly axisymmetric around a single dominant central axis without flat mounting walls or off-axis/cross-bores.
+   - When the exact end-use function of the component is uncertain from geometry alone, use a neutral, geometry-grounded engineering description and explicitly state that the specific end-use application requires drawing/assembly verification—never invent unsupported functional characteristics.
 5. Material: The CAD file metadata material field is: ${JSON.stringify(
         metadata.materialDeclared || 'Not specified in CAD metadata'
-      )}. If it is "Not specified in CAD metadata", you MUST report value: "Not specified in CAD metadata" and source: "Not Specified in CAD File", and clearly state any candidate materials (such as alloy steel, cast iron, or structural aluminum depending on functional requirements) as engineering assumptions requiring verification.
-6. Reference exact feature IDs (e.g., HOLE-01, BOSS-01, FACE-P01, CHAM-01) and measured values (in mm) in your geometric description and manufacturing justifications.
+      )}. If it is "Not specified in CAD metadata", you MUST report value: "Not specified in CAD metadata" and source: "Not Specified in CAD File", and clearly state any candidate materials as engineering assumptions requiring verification.
+6. Reference exact feature IDs (e.g., HOLE-01, BOSS-01, FACE-P01, CHAM-01) and measured values (in mm) in your geometric description, 3D spatial relationships, and manufacturing justifications.
 
 CAD File Metadata:
 ${JSON.stringify(sanitizedMetadata, null, 2)}
@@ -271,7 +272,7 @@ ${JSON.stringify(compactDims, null, 2)}`;
 
       const config = {
         systemInstruction:
-          'You are a Principal Manufacturing & Metrology CAD Engineer. Produce an accurate, traceable engineering description strictly grounded in the provided CAD geometry and header metadata. Never output mesh triangle/vertex counts, B-Rep face/edge counts, or tessellation diagnostics. Treat filename-derived component names, candidate materials, and candidate manufacturing processes as engineering hypotheses/assumptions unless explicitly declared in CAD metadata.',
+          'You are a Principal Manufacturing & Metrology CAD Engineer. Produce an accurate, traceable engineering description strictly grounded in the provided 3D CAD geometry, spatial feature relationships, and header metadata. Never output mesh triangle/vertex counts, B-Rep face/edge counts, or tessellation diagnostics. Never classify a part as a turned shaft or camshaft solely from cylindrical features unless the entire 3D geometry is truly rotational. Use a neutral geometry-grounded description when end-use function is uncertain.',
         responseMimeType: 'application/json',
         responseSchema: {
           type: Type.OBJECT,
@@ -279,12 +280,18 @@ ${JSON.stringify(compactDims, null, 2)}`;
             partIdentification: {
               type: Type.STRING,
               description:
-                'Concise engineering name and classification of the part or subassembly based on its geometry and file metadata.',
+                'Neutral, geometry-grounded engineering classification of the part based on its overall 3D form and feature relationships, noting if specific end-use function requires drawing verification.',
             },
             functionalSummary: {
               type: Type.STRING,
               description:
-                '2-3 sentence technical overview describing the part geometry, symmetry, mounting arrangement, and primary mechanical interfaces.',
+                '2-3 sentence technical overview describing the overall 3D form, spatial arrangement of planar datums, bores, and bosses, and primary mechanical interfaces without inventing unsupported functional claims.',
+            },
+            spatialRelationships: {
+              type: Type.ARRAY,
+              items: { type: Type.STRING },
+              description:
+                'List of 3D spatial relationships between features (coaxiality of bores and bosses with radial wall thickness, parallel bore center-to-center spacing, perpendicularity/parallelism to primary planar datums, and opposing planar wall thickness).',
             },
             majorGeometricFeatures: {
               type: Type.ARRAY,
@@ -327,7 +334,7 @@ ${JSON.stringify(compactDims, null, 2)}`;
                   geometricJustification: {
                     type: Type.STRING,
                     description:
-                      'Concrete justification referencing specific bores, bosses, planar faces, or wall thicknesses.',
+                      'Concrete justification referencing the overall 3D form and specific spatial relationships between bores, bosses, planar faces, or wall thicknesses.',
                   },
                 },
                 required: ['processName', 'suitability', 'geometricJustification'],
@@ -337,12 +344,13 @@ ${JSON.stringify(compactDims, null, 2)}`;
               type: Type.ARRAY,
               items: { type: Type.STRING },
               description:
-                'Actionable workholding, datum selection, and toolpath considerations grounded in the part geometry.',
+                'Actionable workholding, datum selection, and toolpath considerations grounded in the 3D part geometry.',
             },
           },
           required: [
             'partIdentification',
             'functionalSummary',
+            'spatialRelationships',
             'majorGeometricFeatures',
             'materialSpecification',
             'manufacturingProcesses',
@@ -352,7 +360,7 @@ ${JSON.stringify(compactDims, null, 2)}`;
       };
 
       let response: any = null;
-      for (const modelName of ['gemini-3-flash-preview', 'gemini-2.5-flash']) {
+      for (const modelName of ['gemini-3.8-flash']) {
         try {
           response = await ai.models.generateContent({
             model: modelName,
@@ -361,7 +369,7 @@ ${JSON.stringify(compactDims, null, 2)}`;
           });
           if (response?.text) break;
         } catch {
-          // Try next model or fall back to deterministic analysis
+          // Fall back to deterministic analysis
         }
       }
 
@@ -605,7 +613,7 @@ ${JSON.stringify(compactDims, null, 2)}`;
 
       const ai = getGenAIClient();
       const response = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
+        model: 'gemini-3.8-flash',
         contents: `User Instruction: "${instruction}"
 Currently Selected Face/Feature in 3D Viewer: ${selectedFeatureId || 'None'}
 Available Recognized Features on Part:
@@ -810,7 +818,7 @@ Select and invoke the exact CAD modification tool that fulfills the user's instr
 Return ONLY a JSON object with keys: electricitySekPerKwh (number), laborSekPerHour (number), rawMaterialPriceSekPerKg (number), scrapCreditSekPerKg (number), marketNote (string).`;
 
       const response = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
+        model: 'gemini-3.8-flash',
         contents: searchPrompt,
         config: {
           tools: [{ googleSearch: {} }],
@@ -922,18 +930,20 @@ Return ONLY a JSON object with keys: electricitySekPerKwh (number), laborSekPerH
 
       if (
         lower.includes('valid') ||
+        lower.includes('verif') ||
         lower.includes('trust') ||
         lower.includes('fact') ||
         lower.includes('assum') ||
+        lower.includes('predict') ||
         lower.includes('uncert') ||
         lower.includes('review')
       ) {
         const vr = cost.validationReport || {};
         return {
-          answer: `**Engineering Validation & Data Provenance (${revisionLabel} — ${meta.fileName || 'Active Part'})**:\n\n• **Validation Status**: **${vr.overallStatus || 'VALIDATED_WITH_ASSUMPTIONS'}** — ${vr.summaryNote || 'All volume, material, stock containment, and cost equations verified.'}\n• **Net Solid Volume**: **${authoritativeVolCm3} cm³** (consistent across Stage 1B Geometry Summary, Stage 4 BOM sum = ${vr.bomTotalVolumeCm3 ?? authoritativeVolCm3} cm³, and Stage 6 Cost Engine).\n• **Material & Density Synchronization**: *${cost.assumedOrDeclaredMaterial || 'Assumed Alloy'}* (**${cost.materialDensityGPerCm3 ?? 'N/A'} g/cm³**, Virgin Stock **${cost.marketRates?.rawMaterialPriceSekPerKg ?? 'N/A'} SEK/kg**, Swarf Credit **${cost.marketRates?.scrapCreditSekPerKg ?? 'N/A'} SEK/kg**).\n• **Physical Stock Geometry Containment**: **${stockVal?.geometricallyContainsPart !== false ? 'VERIFIED' : 'ENGINEERING REVIEW REQUIRED'}** — ${stockVal?.containmentVerificationNote || cost.recommendedRawStockBillet || 'Verified against 3D part envelope.'}\n• **CAD Facts vs. Costing Assumptions**: Overall bounding envelope dimensions (${envX} × ${envY} × ${envZ} mm), solid volume, surface area, and extracted cylindrical/planar features are **CAD-extracted measurements**, whereas component functional identity, material grade (*${cost.assumedOrDeclaredMaterial || 'Assumed Alloy'}*), ISO 2768-mK tolerances, batch size (${cost.batchSize ?? 10} pcs), and process route (*${cost.alignedManufacturingProcess || 'Candidate Route'}*) are explicit **engineering & costing assumptions** editable in Stage 6.`,
+          answer: `**What "Verified" Means vs. Predicted/Assumed Specifications (${revisionLabel} — ${meta.fileName || 'Active Part'})**:\n\n• **1. Measured & Verified Directly from the 3D CAD Model**:\n  - **Overall 3D Envelope**: ΔX = **${envX} mm** × ΔY = **${envY} mm** × ΔZ = **${envZ} mm** (measured directly in 3D space from the CAD mesh and projected onto the 2D views).\n  - **3D Solid Volume**: **${authoritativeVolCm3} cm³** (consistent across Stage 1B, Stage 4 BOM sum = ${vr.bomTotalVolumeCm3 ?? authoritativeVolCm3} cm³, and Stage 6 Cost Calculation).\n  - **3D Stock Containment & Mass Balance**: Raw stock (${stockVal?.stockDimensionsFormatted || cost.recommendedRawStockBillet || 'Validated Blank'}) physically encloses the 3D part along all axes (**${stockVal?.geometricallyContainsPart !== false ? 'VERIFIED' : 'ENGINEERING REVIEW REQUIRED'}**), and $m_{\\text{raw}} - m_{\\text{net}} = m_{\\text{swarf}}$ is verified.\n• **2. Predicted / Assumed (Because Not Present in the 3D CAD Geometry)**:\n  - Material grade (*${cost.assumedOrDeclaredMaterial || 'Assumed Alloy'}*, ${cost.materialDensityGPerCm3 ?? 'N/A'} g/cm³)${meta.materialDeclared ? ' (extracted from CAD metadata)' : ' (predicted/assumed because not embedded in the 3D file)'}, ISO 2768-mK tolerances, surface roughness (Ra 3.2 μm), batch size (${cost.batchSize ?? 10} pcs), and Sweden shop rates are engineering predictions/assumptions that you can edit in Stage 6.`,
           referencedSections: [
-            'Stage 1B: Geometric Feature Summary',
-            'Stage 6: CAD-to-Cost Validation Matrix',
+            'Stage 1B: 3D-Extracted Dimensions & Specifications',
+            'Stage 6: What "Verified" Means & Cost Calculation',
           ],
         };
       }
@@ -948,23 +958,24 @@ Return ONLY a JSON object with keys: electricitySekPerKwh (number), laborSekPerH
         lower.includes('labor') ||
         lower.includes('route') ||
         lower.includes('equation') ||
-        lower.includes('cycle')
+        lower.includes('cycle') ||
+        lower.includes('final')
       ) {
         const cb = cost.costBreakdownPerUnit || {};
         const mr = cost.marketRates || {};
         const ctb = cost.cycleTimeBreakdown || {};
-        const routes: any[] = cost.processRouteComparisons || [];
-        const routeSummary = routes
+        const compBreakdowns: any[] = cost.componentCostBreakdowns || [];
+        const compCostLines = compBreakdowns
           .map(
-            (r) =>
-              `${r.routeName}: **${r.unitTotalCostSek} SEK** (Cycle ${r.cycleTimeMin} min, Chip Removal ${r.chipRemovalPct}%)`
+            (c) =>
+              `  - **BOM Item #${c.itemNumber} (${c.componentName}, Qty ${c.quantity})**: Process = *${c.primaryProcess}* | Raw ${c.rawMassKg} kg → Net ${c.netMassKg} kg | Component Cost = **${Number(c.totalComponentCostSek || 0).toFixed(2)} SEK** (€${Number(c.totalComponentCostEur || 0).toFixed(2)} EUR)`
           )
-          .join('\n  - ');
+          .join('\n');
         return {
-          answer: `**Scenario-Based Manufacturing Cost Estimate (${revisionLabel} — ${meta.fileName || 'Part'})**:\n\n• **Active Candidate Process Route**: **${cost.alignedManufacturingProcess || 'Route A: Multi-Axis CNC Machining'}** | Batch Size: **${cost.batchSize ?? 10} units** | Material: *${cost.assumedOrDeclaredMaterial || 'Assumed Alloy'}* (${cost.materialDensityGPerCm3 ?? 'N/A'} g/cm³)\n• **Validated Physical Raw Stock**: **${stockVal?.stockShapeLabel || 'Standard Stock'}** (${stockVal?.stockDimensionsFormatted || cost.recommendedRawStockBillet}) — Gross Volume **${cost.rawStockVolumeCm3 ?? 'N/A'} cm³**\n• **Net Solid Volume**: **${authoritativeVolCm3} cm³** → Net Mass **${cost.netPartMassGrams ?? 'N/A'} g** | Raw Stock Mass **${cost.rawStockMassGrams ?? 'N/A'} g** | Chip Removal Mass **${cost.scrapMassGrams ?? 'N/A'} g**\n• **Scenario-Based Unit Cost Estimate**: **${cb.totalUnitCostSek ?? 'N/A'} SEK** (**€${cb.totalUnitCostEur ?? 'N/A'} EUR**) — Status: **${cost.validationReport?.overallStatus || 'VALIDATED_WITH_ASSUMPTIONS'}**\n  - **Net Raw Material**: **${cb.rawMaterialCostSek ?? 'N/A'} SEK** (Gross stock − swarf credit at ${mr.rawMaterialPriceSekPerKg ?? 'N/A'} SEK/kg)\n  - **Sweden SE3 Electricity**: **${cb.electricityCostSek ?? 'N/A'} SEK** (${cost.energyConsumptionKwh ?? 'N/A'} kWh × ${mr.electricityPriceSekPerKwh ?? '0.91'} SEK/kWh)\n  - **Direct CNC Operator Manpower**: **${cb.manpowerCostSek ?? 'N/A'} SEK** (Machining + load/unload at ${mr.cncOperatorHourlyRateSek ?? '645'} SEK/h incl. 31.42% *arbetsgivaravgifter*)\n  - **Machine Depreciation & Tooling**: **${cb.toolingAndMachineDepreciationSek ?? 'N/A'} SEK** (Spindle center at ${mr.machineDepreciationHourlySek ?? '580'} SEK/h + cutter wear + QA/finishing)\n  - **Amortized Setup & CAM**: **${cb.setupAndCamAmortizedSek ?? 'N/A'} SEK** (Setup ${ctb.setupTimeTotalMin ?? 45} min / ${cost.batchSize ?? 10} pcs)\n• **Process Cycle Time (${ctb.totalMachiningCycleTimeMin ?? cost.estimatedMachiningTimeMinutes ?? 'N/A'} min/part)**: ${ctb.explicitCycleTimeEquation || 'Roughing V_rem/MRR + Finishing A/R_fin + Drilling (when bores exist) + Tool Changes + Load/Unload'}\n• **Process Route Comparison**:\n  - ${routeSummary || 'See Stage 6 Process Route Comparison Table.'}`,
+          answer: `**Component-to-Part Manufacturing Cost Calculation (${revisionLabel} — ${meta.fileName || 'Part'})**:\n\n• **1. 3D Volume & Raw Stock Basis**:\n  - 3D Measured Net Volume: **${authoritativeVolCm3} cm³** → Net Mass **${cost.netPartMassGrams ?? 'N/A'} g** | Validated Raw Stock: **${stockVal?.stockDimensionsFormatted || cost.recommendedRawStockBillet}** (${cost.rawStockMassGrams ?? 'N/A'} g gross, ${cost.scrapMassGrams ?? 'N/A'} g swarf)\n• **2. Predicted / Assumed Costing Inputs**:\n  - Material: *${cost.assumedOrDeclaredMaterial || 'Assumed Alloy'}* (${cost.materialDensityGPerCm3 ?? 'N/A'} g/cm³) | Route: **${cost.alignedManufacturingProcess || 'CNC Machining'}** | Batch: **${cost.batchSize ?? 10} pcs**\n• **3. Cost per BOM Component**:\n${compCostLines || `  - Primary Component: **${cb.totalUnitCostSek ?? 'N/A'} SEK**`}\n• **4. Final Cost of the Part (Sum of BOM Components, Per Piece)**: **${cb.totalUnitCostSek ?? 'N/A'} SEK** (**€${cb.totalUnitCostEur ?? 'N/A'} EUR**)\n  - Net Raw Material: **${cb.rawMaterialCostSek ?? 'N/A'} SEK** (${mr.rawMaterialPriceSekPerKg ?? 'N/A'} SEK/kg minus swarf credit)\n  - Sweden SE3 Electricity: **${cb.electricityCostSek ?? 'N/A'} SEK** (${cost.energyConsumptionKwh ?? 'N/A'} kWh × ${mr.electricityPriceSekPerKwh ?? '0.91'} SEK/kWh)\n  - Direct CNC Operator Labor: **${cb.manpowerCostSek ?? 'N/A'} SEK** (${mr.cncOperatorHourlyRateSek ?? '645'} SEK/h)\n  - Machine Center & Tooling: **${cb.toolingAndMachineDepreciationSek ?? 'N/A'} SEK** (${mr.machineDepreciationHourlySek ?? '580'} SEK/h + tooling + QA)\n  - Amortized Setup & CAM: **${cb.setupAndCamAmortizedSek ?? 'N/A'} SEK** (${ctb.setupTimeTotalMin ?? 45} min / ${cost.batchSize ?? 10} pcs)\n• **Cycle Time (${ctb.totalMachiningCycleTimeMin ?? cost.estimatedMachiningTimeMinutes ?? 'N/A'} min/pc)**: ${ctb.explicitCycleTimeEquation || 'Roughing + Finishing + Drilling + Tool Changes + Load/Unload'}`,
           referencedSections: [
-            'Stage 6: Scenario-Based Manufacturing Cost Estimate',
             'Stage 4: Consolidated Bill of Materials',
+            'Stage 6: Per-Component & Final Part Cost Calculation',
           ],
         };
       }
@@ -973,6 +984,7 @@ Return ONLY a JSON object with keys: electricitySekPerKwh (number), laborSekPerH
         lower.includes('bom') ||
         lower.includes('bill of material') ||
         lower.includes('component') ||
+        lower.includes('process') ||
         lower.includes('stock') ||
         lower.includes('mass') ||
         lower.includes('weight')
@@ -980,12 +992,12 @@ Return ONLY a JSON object with keys: electricitySekPerKwh (number), laborSekPerH
         const bomLines = bom
           .map(
             (b) =>
-              `• **Item ${b.itemNumber} — ${b.componentName}** (Qty: ${b.quantity}): Role: *${b.structuralRole || 'Primary Body'}* | Material: *${b.material}* (${b.densityGPerCm3} g/cm³) | Candidate Process: *${b.manufacturingProcess}* | Envelope: ${b.boundingBoxMm} | Validated Stock: ${b.stockValidation?.stockDimensionsFormatted || b.recommendedRawStock} | Net Solid Volume: **${b.volumeCm3} cm³** (${b.chipRemovalRatioPct}% chip removal) | Est. Mass: **${b.estimatedMassGrams} g**`
+              `• **BOM Item #${b.itemNumber} — ${b.componentName}** (Qty: ${b.quantity}):\n  - **3D Envelope & Volume**: ${b.boundingBoxMm} | Net Solid Volume: **${b.volumeCm3} cm³** | Net Mass: **${b.estimatedMassGrams} g**\n  - **Material**: *${b.material}* (${b.densityGPerCm3} g/cm³ — ${meta.materialDeclared ? 'from CAD metadata' : 'predicted/assumed'})\n  - **Manufacturing Process**: **${b.manufacturingProcess}** (Secondary: ${b.secondaryOperations})\n  - **Raw Stock & Chip Removal**: ${b.rawStockDimensionsMm} (${b.chipRemovalRatioPct}% chip removal)`
           )
           .join('\n');
         return {
-          answer: `**Consolidated Bill of Materials (${revisionLabel} — Net Solid Volume: ${authoritativeVolCm3} cm³)**:\n\n${bomLines}\n\nAll BOM component volumes sum to **${authoritativeVolCm3} cm³**, and physical stock containment is **${stockVal?.geometricallyContainsPart !== false ? 'VERIFIED' : 'ENGINEERING REVIEW REQUIRED'}**.`,
-          referencedSections: ['Stage 4: Consolidated Bill of Materials', 'Stage 2: Part Description'],
+          answer: `**BOM Structure & Manufacturing Process per Component (${revisionLabel} — Total 3D Solid Volume: ${authoritativeVolCm3} cm³)**:\n\n${bomLines}`,
+          referencedSections: ['Stage 4: Consolidated Bill of Materials', 'Stage 6: Component Cost Breakdown'],
         };
       }
 
@@ -995,37 +1007,39 @@ Return ONLY a JSON object with keys: electricitySekPerKwh (number), laborSekPerH
             ? holes
                 .map(
                   (h) =>
-                    `${h.id}: Ø${Number(h.diameterMm || 0).toFixed(2)} mm (depth ${Number(h.depthOrLengthMm || 0).toFixed(2)} mm)`
+                    `${h.id}: Ø${Number(h.diameterMm || 0).toFixed(2)} mm × ${Number(h.depthOrLengthMm || 0).toFixed(2)} mm`
                 )
                 .join('; ')
-            : 'No closed cylindrical through-holes/bores identified on the current geometry (drilling time = 0.00 min)';
+            : 'No internal cylindrical holes detected in the 3D mesh (drilling time = 0.00 min)';
         const bossList =
           bosses.length > 0
             ? bosses
                 .map(
                   (b) =>
-                    `${b.id} (${b.name || 'Cylindrical Section'}): Ø${Number(b.diameterMm || 0).toFixed(2)} mm (length ${Number(b.depthOrLengthMm || 0).toFixed(2)} mm)`
+                    `${b.id} (${b.name || 'Cylindrical Section'}): Ø${Number(b.diameterMm || 0).toFixed(2)} mm × ${Number(b.depthOrLengthMm || 0).toFixed(2)} mm`
                 )
                 .join('; ')
-            : 'No external cylindrical sections/bosses detected';
+            : 'No external cylindrical bosses/journals detected';
         return {
-          answer: `**Cylindrical & Functional Feature Summary (${revisionLabel})**:\n\n• **Identified Holes / Bores (${holes.length})**: ${holeList}.\n• **Identified External Cylindrical / Journal / Lobe Sections (${bosses.length})**: ${bossList}.\n• **Planar Reference Faces (${planes.length})**: Primary reference surface is ${planes[0]?.id || 'FACE-P01'} (${Number(planes[0]?.areaMm2 || 0).toFixed(1)} mm²).`,
-          referencedSections: ['Stage 1: 2D Engineering Drawings & Feature Summary', 'Stage 2: Part Description'],
+          answer: `**3D-Measured Features on ${meta.fileName || 'Part'} (${revisionLabel})**:\n\n• **Internal Bores / Holes (${holes.length})**: ${holeList}.\n• **Outer Cylindrical Sections / Bosses (${bosses.length})**: ${bossList}.\n• **Planar Reference Faces (${planes.length})**: Primary datum surface is ${planes[0]?.id || 'FACE-P01'} (${Number(planes[0]?.areaMm2 || 0).toFixed(1)} mm²).\n• **Predicted / Assumed Note**: Diameters and axial lengths are measured directly in 3D from the CAD mesh; thread pitch and fit tolerances (e.g., H7/g6) are not stored in the 3D geometry and are predicted when estimating finishing operations.`,
+          referencedSections: ['Stage 1B: 3D-Extracted Dimensions & Specifications', 'Stage 2: Part Description'],
         };
       }
 
       if (
         lower.includes('dimension') ||
+        lower.includes('measure') ||
+        lower.includes('3d') ||
+        lower.includes('2d') ||
         lower.includes('size') ||
         lower.includes('envelope') ||
         lower.includes('volume') ||
         lower.includes('area') ||
-        lower.includes('2d') ||
         lower.includes('drawing')
       ) {
         return {
-          answer: `**Part Dimensions & Solid Volume (${revisionLabel})**:\n\n• **Overall Bounding Envelope (CAD Measurement)**: ΔX = **${envX} mm** × ΔY = **${envY} mm** × ΔZ = **${envZ} mm**.\n• **Net Solid Volume**: **${authoritativeVolCm3} cm³** (consistent across Stage 1B, Stage 4 BOM, and Stage 6 Costing) | **Total Surface Area**: **${area} cm²**.\n• **2D Orthographic Projections (Stage 1A)**: ASME Y14.3 / ISO 128 Third-Angle layout with Top View, Section A-A, Front View, and Right Side View.`,
-          referencedSections: ['Stage 1: 2D Engineering Drawings & Feature Summary'],
+          answer: `**How Dimensions Are Measured (3D vs. 2D) for ${meta.fileName || 'Part'} (${revisionLabel})**:\n\n• **Measured Directly from the 3D CAD Model**: All dimensions are extracted directly in 3D space (millimeters) from the 3D CAD solid/mesh coordinates and then projected 1:1 onto the 2D views (Top, Front, Side, and Section A-A).\n• **Overall 3D Envelope**: ΔX = **${envX} mm** × ΔY = **${envY} mm** × ΔZ = **${envZ} mm**.\n• **3D Solid Volume & Surface Area**: **${authoritativeVolCm3} cm³** solid volume | **${area} cm²** surface area.`,
+          referencedSections: ['Stage 1A: 3D-to-2D Views', 'Stage 1B: 3D-Extracted Dimensions'],
         };
       }
 
@@ -1035,18 +1049,17 @@ Return ONLY a JSON object with keys: electricitySekPerKwh (number), laborSekPerH
             ? mods.map((m) => `• **${m.operationName}** [${m.status}]: ${m.summary}`).join('\n')
             : 'No 3D modifications have been committed yet in Stage 5.';
         return {
-          answer: `**Interactive 3D Modification Status (${revisionLabel})**:\n\n${modText}\n\nNote: Pre-commit geometry validation is active — any modification that produces zero geometric change (no-op) is automatically rejected without creating a redundant revision.`,
+          answer: `**Interactive 3D Modification Status (${revisionLabel})**:\n\n${modText}\n\nPre-commit geometry validation ensures every applied modification updates the 3D mesh, 2D views, BOM volume, and per-piece cost simultaneously.`,
           referencedSections: ['Stage 5: Interactive 3D Modification'],
         };
       }
 
       return {
-        answer: `**Engineering Summary for ${meta.fileName || 'Uploaded CAD Part'} (Revision ${revisionLabel})**:\n\n• **Envelope Dimensions (CAD Measurement)**: ${envX} × ${envY} × ${envZ} mm\n• **Net Solid Volume**: **${authoritativeVolCm3} cm³** | **Surface Area**: **${area} cm²**\n• **Identified Features**: ${holes.length} hole(s)/bore(s), ${bosses.length} external cylindrical section(s)/boss(es), and ${planes.length} planar reference surface(s)\n• **Material & Density**: *${cost.assumedOrDeclaredMaterial || 'Assumed Alloy'}* (**${cost.materialDensityGPerCm3 ?? 'N/A'} g/cm³**)\n• **Validated Raw Stock**: ${stockVal?.stockShapeLabel || 'Standard Stock'} (${stockVal?.stockDimensionsFormatted || cost.recommendedRawStockBillet})\n• **Active Candidate Manufacturing Route**: ${cost.alignedManufacturingProcess || 'Multi-Axis CNC Machining'}\n• **Scenario-Based Manufacturing Cost Estimate (${cost.batchSize ?? 10}-unit batch)**: **${cost.costBreakdownPerUnit?.totalUnitCostSek ?? 'N/A'} SEK** (**€${cost.costBreakdownPerUnit?.totalUnitCostEur ?? 'N/A'} EUR**) — Status: **${cost.validationReport?.overallStatus || 'VALIDATED_WITH_ASSUMPTIONS'}**.`,
+        answer: `**Engineering & Cost Summary for ${meta.fileName || 'Part'} (${revisionLabel})**:\n\n1. **3D-Extracted Dimensions**: Overall envelope **${envX} × ${envY} × ${envZ} mm**, enclosed 3D solid volume **${authoritativeVolCm3} cm³**, and surface area **${area} cm²** (measured directly in 3D space and projected to the 2D views).\n2. **Engineering Specifications**: ${holes.length} internal bore(s), ${bosses.length} outer cylindrical section(s), ${planes.length} planar face(s). Material *${cost.assumedOrDeclaredMaterial || 'Assumed Alloy'}* (${cost.materialDensityGPerCm3 ?? 'N/A'} g/cm³) and ISO 2768-mK tolerances are ${meta.materialDeclared ? 'extracted from CAD metadata' : 'predicted/assumed because they are not embedded in the 3D geometry'}.\n3. **BOM & Manufacturing Process**: ${bom.length} BOM component(s) manufactured via **${cost.alignedManufacturingProcess || 'CNC Machining'}** from validated stock **${stockVal?.stockDimensionsFormatted || cost.recommendedRawStockBillet}**.\n4. **Final Part Cost (Sum of BOM Components, N=${cost.batchSize ?? 10} pcs)**: **${cost.costBreakdownPerUnit?.totalUnitCostSek ?? 'N/A'} SEK** (**€${cost.costBreakdownPerUnit?.totalUnitCostEur ?? 'N/A'} EUR**) per piece.`,
         referencedSections: [
-          'Stage 1: 2D Engineering Drawings & Feature Summary',
-          'Stage 2: Part Description',
+          'Stage 1: 3D-to-2D Views & 3D Extracted Dimensions',
           'Stage 4: Consolidated Bill of Materials',
-          'Stage 6: Scenario-Based Manufacturing Cost Estimate',
+          'Stage 6: Per-Component & Final Part Cost Calculation',
         ],
       };
     };
@@ -1064,19 +1077,20 @@ Return ONLY a JSON object with keys: electricitySekPerKwh (number), laborSekPerH
             }
           : {},
       };
-      const sysPrompt = `You are the Principal CAD & Manufacturing Cost Engineering Assistant for CADSight.
+      const sysPrompt = `You are a top 1% Manufacturing Engineer and Cost Engineer acting as the Part Engineering and Cost Assistant for ${partContext?.metadata?.fileName || 'the uploaded 3D part'}.
 CRITICAL RULES:
-1. You are an EXPLAINER and ORCHESTRATOR only — NEVER invent, re-estimate, or hallucinate any volume, mass, cycle time, stock dimension, or cost number.
-2. NEVER mention or output B-Rep face/edge counts, mesh triangle/vertex counts, CAD stream counts, tessellation statistics, or raw topology diagnostics.
-3. Always read the active part (${partContext?.metadata?.fileName || 'Uploaded Part'}), active geometry revision (${partContext?.versionLabel || 'v1'}), net solid volume (${partContext?.costEstimate?.authoritativeVolumeCm3 ?? partContext?.geometryAnalysisReport?.materialVolumeEstimates?.netSolidVolumeCm3} cm³), active material & density (${partContext?.costEstimate?.assumedOrDeclaredMaterial} at ${partContext?.costEstimate?.materialDensityGPerCm3} g/cm³), validated raw stock geometry (${partContext?.costEstimate?.stockValidation?.stockDimensionsFormatted || partContext?.costEstimate?.recommendedRawStockBillet}), and Scenario-Based Manufacturing Cost Estimate (${partContext?.costEstimate?.costBreakdownPerUnit?.totalUnitCostSek} SEK) strictly from the Ground-Truth Part Context below. Never reference any previous part or previous upload.
-4. Explicitly distinguish CAD-extracted geometric measurements (bounding box, solid volume, surface area, identified holes/cylindrical sections/planar faces) from engineering hypotheses and costing assumptions (component identity, assumed material alloy, ISO 2768-mK tolerances, batch size, stock allowance, machine/operator rates).
-5. Quote the explicit equations from componentCostBreakdowns and cycleTimeBreakdown when explaining how costs or cycle times were derived.
+1. Keep your answer simple, direct, and grounded 100% in the 3D CAD model context below. Never invent or hallucinate any dimension, volume, mass, cycle time, or cost number.
+2. NEVER mention B-Rep face/edge counts, mesh triangle/vertex counts, CAD stream counts, or tessellation statistics.
+3. Follow the real-world manufacturing & cost engineering logic:
+   - Dimensions (${partContext?.geometryAnalysisReport?.boundingDimensionsMm?.lengthX} × ${partContext?.geometryAnalysisReport?.boundingDimensionsMm?.widthY} × ${partContext?.geometryAnalysisReport?.boundingDimensionsMm?.heightZ} mm) and 3D solid volume (${partContext?.costEstimate?.authoritativeVolumeCm3 ?? partContext?.geometryAnalysisReport?.materialVolumeEstimates?.netSolidVolumeCm3} cm³) are measured directly in 3D space from the 3D CAD model and projected onto the 2D views.
+   - Explicitly state when a specification (such as material alloy ${partContext?.costEstimate?.assumedOrDeclaredMaterial}, ISO 2768-mK tolerances, surface finish, or batch size) is PREDICTED / ASSUMED because it cannot be extracted from the 3D geometry alone.
+   - Explain the BOM components, the manufacturing process for each BOM component, the cost calculation for each BOM component (quoting the explicit equations from componentCostBreakdowns), and how the component costs sum to the final part cost (${partContext?.costEstimate?.costBreakdownPerUnit?.totalUnitCostSek} SEK / €${partContext?.costEstimate?.costBreakdownPerUnit?.totalUnitCostEur} EUR).
 
-Ground-Truth Part Context:
+Ground-Truth 3D Part & Cost Context:
 ${JSON.stringify(sanitizedPartContext || {}, null, 2)}`;
 
       const response = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
+        model: 'gemini-3.8-flash',
         contents: q,
         config: {
           systemInstruction: sysPrompt,

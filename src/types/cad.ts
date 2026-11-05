@@ -139,6 +139,7 @@ export interface GeometryAnalysisReport {
   factsVsAssumptions?: CadFactVsAssumptionRow[];
   surfaceClassifications: SurfaceClassificationSummary[];
   candidateHolesAndCylinders: CandidateCylindricalFeature[];
+  spatialRelationships?: string[];
   missingManufacturingSpecifications: {
     attribute: string;
     status: 'SPECIFIED IN CAD' | 'MISSING IN CAD FILE';
@@ -213,6 +214,15 @@ export interface BomEntry {
   triangleCount: number;
   componentIndices: number[];
   stockValidation?: RawStockGeometryValidation;
+  componentSourceType?: 'MANUFACTURED_CUSTOM' | 'PURCHASED_STANDARD_CATALOG';
+  componentCategory?: string;
+  materialGradeKey?: 'AL_6082' | 'STEEL_42CRMO4' | 'SS_316L' | 'TI_6AL4V' | 'BRASS_CW614N';
+  unitVolumeCm3?: number;
+  unitRawStockVolumeCm3?: number;
+  unitSurfaceAreaCm2?: number;
+  unitEstimatedMassGrams?: number;
+  assumedPurchasedUnitCostSek?: number;
+  purchasedCostBasisNote?: string;
 }
 
 export interface CostBatchTier {
@@ -249,6 +259,9 @@ export interface ComponentCostBreakdown {
   operationCosts: ComponentCostOperationRow[];
   totalComponentCostSek: number;
   totalComponentCostEur: number;
+  componentSourceType?: 'MANUFACTURED_CUSTOM' | 'PURCHASED_STANDARD_CATALOG';
+  unitComponentCostSek?: number;
+  unitComponentCostEur?: number;
 }
 
 export interface PreviewGeometryOverlay {
@@ -499,6 +512,10 @@ export interface ManufacturingCostEstimate {
     totalUnitCostEur: number;
   };
   componentCostBreakdowns: ComponentCostBreakdown[];
+  assemblyAndTestingCostSek?: number;
+  assemblyAndTestingCostEur?: number;
+  assemblyAndTestingMinutes?: number;
+  assemblyAndTestingBasis?: string;
   processRouteComparisons?: ProcessRouteComparisonRow[];
   cycleTimeBreakdown?: CycleTimePhysicsBreakdown;
   rateProvenanceTable?: MarketRateProvenanceRow[];
@@ -555,6 +572,7 @@ export interface PartEngineeringDescription {
   partIdentification: string;
   functionalSummary: string;
   majorGeometricFeatures: string[];
+  spatialRelationships?: string[];
   materialSpecification: {
     value: string;
     source: 'CAD Header Metadata' | 'Not Specified in CAD File';
@@ -578,6 +596,9 @@ export interface CadComponentMeshData {
   positions: Float32Array; // non-indexed or indexed triangle soup (3 floats per vertex)
   normals: Float32Array;
   faceIdPerTriangle: Int32Array; // maps each triangle to feature index
+  parentAssemblyName?: string | null;
+  sourceMeshKey?: string;
+  localBboxMm?: [number, number, number];
 }
 
 export interface CadFileMetadata {
@@ -591,6 +612,11 @@ export interface CadFileMetadata {
   headerComments: string[];
   isAssembly: boolean;
   uploadedAt: string;
+  hasNativeBrepAnalytics?: boolean;
+  nativeStepCylindricalRadiiMm?: number[];
+  nativeStepFilletRadiiMm?: number[];
+  nativeProductCount?: number;
+  nativeAssemblyOccurrenceCount?: number;
 }
 
 export interface CadModificationRecord {
